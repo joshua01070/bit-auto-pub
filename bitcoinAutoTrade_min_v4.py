@@ -19,7 +19,7 @@ RSI_PERIOD = 14
 RSI_THRESHOLD = 45
 MA_SHORT, MA_LONG = 5, 20
 FEE = 0.0005
-TP1_RATE, TP2_RATE = 0.015, 0.04
+TP1_RATE, TP2_RATE = 0.15, 0.04
 TP1_PCT = 0.40
 TRAILING_STEP, TRAILING_STEP_AFTER_TP1 = 0.08, 0.04
 INTERVAL, POLL_SECONDS = "minute1", 20
@@ -29,8 +29,11 @@ MIN_KRW_ORDER = 6000
 MAX_ENTRIES = None  # 최대 진입 횟수 제한 (None = 무제한)
 
 # 로깅 설정
-logging.basicConfig(level=logging.INFO,
-                    format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
 upbit = pyupbit.Upbit(ACCESS, SECRET)
 
 # === safe_order ===
@@ -50,13 +53,20 @@ class Position:
         self.total_qty = 0.0
         self.tp1_done = False
         self.trailing_stop = None
+
     def to_dict(self):
-        return {"entries": self.entries, "tp1_done": self.tp1_done, "trailing_stop": self.trailing_stop}
+        return {
+            "entries": self.entries,
+            "tp1_done": self.tp1_done,
+            "trailing_stop": self.trailing_stop
+        }
+
     def save(self):
         tmp = STATE_PATH + ".tmp"
         with open(tmp, 'w') as f:
             json.dump(self.to_dict(), f)
         os.replace(tmp, STATE_PATH)
+
     @classmethod
     def load(cls):
         if not os.path.exists(STATE_PATH):
@@ -71,9 +81,11 @@ class Position:
             return obj
         except:
             return cls()
+
     def add_entry(self, price, qty):
         self.entries.append((price, qty))
         self.total_qty += qty
+
     def reduce_qty(self, qty):
         rem = qty
         new = []
@@ -87,8 +99,10 @@ class Position:
                 rem = 0
         self.entries = new
         self.total_qty = max(0, self.total_qty - qty)
+
     def avg_price(self):
         return sum(p * q for p, q in self.entries) / self.total_qty if self.total_qty else 0
+
     def clear(self):
         self.__init__()
 
@@ -115,7 +129,7 @@ logging.info("=== v4 Bot Start ===")
 
 # === Main Loop ===
 while True:
-    logging.info(f"Heartbeat – bot running")
+    logging.info("Heartbeat – bot running")
     try:
         # 지표 계산
         df = get_ohlc(TICKER, INTERVAL, WARMUP)
@@ -163,57 +177,73 @@ while True:
         diff = btc_bal - position.total_qty
         if abs(diff) > 1e-9:
             logging.warning(f"Manual BTC change Δ={diff:.8f}, sync")
-            (position.add_entry if diff>0 else position.reduce_qty)(abs(diff))
+            if diff > 0:
+                # Add missing BTC at current market price
+                position.add_entry(price, abs(diff))
+            else:
+                # Remove excess BTC
+                position.reduce_qty(abs(diff))
             position.save()
 
         # 매수 로직 (풀 밸런스)
         if MAX_ENTRIES is not None and len(position.entries) >= MAX_ENTRIES:
             logging.info(f"Max entries reached ({MAX_ENTRIES}), skip buy")
-        elif close>tgt and rsi<RSI_THRESHOLD and mas>mal and close>ema_val and krw_bal>MIN_KRW_ORDER:
+        elif (close > tgt and rsi < RSI_THRESHOLD
+              and mas > mal and close > ema_val
+              and krw_bal > MIN_KRW_ORDER):
             prev_avg = position.avg_price()
-            if position.total_qty==0 or close>prev_avg*1.01:
-                buy_amt = krw_bal*(1-FEE)
+            if position.total_qty == 0 or close > prev_avg * 1.01:
+                buy_amt = krw_bal * (1 - FEE)
                 order = safe_order(upbit.buy_market_order, TICKER, buy_amt)
                 filled = float(order['volume']) - float(order['remaining_volume'])
                 position.add_entry(close, filled)
-                position.trailing_stop = max(position.trailing_stop or 0, close*(1-TRAILING_STEP))
+                position.trailing_stop = max(position.trailing_stop or 0,
+                                             close * (1 - TRAILING_STEP))
                 position.save()
                 logging.info(f"BUY #{len(position.entries)} @ {close:.0f} qty={filled:.6f}")
 
-        # 관리 / TP1 / TP2 / 트레일링
-        if position.total_qty>0:
+        # 관리 / TP1 / TP2 / 트레일링 스톱
+        if position.total_qty > 0:
             avg = position.avg_price()
             high, low = row.high, row.low
+
             # TP1
-            if not position.tp1_done and high>=avg*(1+TP1_RATE):
-                q1 = position.total_qty*TP1_PCT
+            if not position.tp1_done and high >= avg * (1 + TP1_RATE):
+                q1 = position.total_qty * TP1_PCT
                 safe_order(upbit.sell_market_order, TICKER, q1)
                 position.reduce_qty(q1)
-                position.tp1_done=True
-                # TP1 직후 트레일 스톱 초기화
+                position.tp1_done = True
                 position.trailing_stop = avg * (1 - TRAILING_STEP_AFTER_TP1)
                 position.save()
                 logging.info(f"TP1 SELL @ {avg*(1+TP1_RATE):.0f} qty={q1:.6f}")
+
             # TP2
-            elif position.tp1_done and high>=avg*(1+TP2_RATE):
+            elif position.tp1_done and high >= avg * (1 + TP2_RATE):
                 safe_order(upbit.sell_market_order, TICKER, position.total_qty)
                 logging.info(f"TP2 SELL @ {avg*(1+TP2_RATE):.0f} qty={position.total_qty:.6f}")
-                position.clear(); position.save()
+                position.clear()
+                position.save()
+
+            # 트레일링 스톱 갱신 및 실행
             else:
-                step = TRAILING_STEP_AFTER_TP1 if position.tp1_done else TRAILING_STEP
-                ts_new = high*(1-step)
-                if ts_new>(position.trailing_stop or 0):
-                    position.trailing_stop=ts_new; position.save()
+                step = (TRAILING_STEP_AFTER_TP1 if position.tp1_done else TRAILING_STEP)
+                ts_new = high * (1 - step)
+                if ts_new > (position.trailing_stop or 0):
+                    position.trailing_stop = ts_new
+                    position.save()
                     logging.info(f"TRAIL UP @ {ts_new:.0f}")
-                if low<=(position.trailing_stop or 0):
+                if low <= (position.trailing_stop or 0):
                     safe_order(upbit.sell_market_order, TICKER, position.total_qty)
                     logging.info(f"TRAIL STOP SELL @ {position.trailing_stop:.0f} qty={position.total_qty:.6f}")
-                    position.clear(); position.save()
+                    position.clear()
+                    position.save()
 
-                    # Reset error counter after successful cycle
+            # 오류 카운터 리셋
             if hasattr(position, '_err_count'):
                 position._err_count = 0
+
         time.sleep(POLL_SECONDS)
+
     except Exception as e:
         # 연속 오류 카운팅
         if not hasattr(position, '_err_count'):
