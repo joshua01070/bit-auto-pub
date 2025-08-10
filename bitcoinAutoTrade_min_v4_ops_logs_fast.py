@@ -9,8 +9,8 @@ import pandas as pd
 import pyupbit
 
 # === 하드코딩 API 키 (여기에 입력) ===
-ACCESS = "YOUR_UPBIT_ACCESS_KEY"
-SECRET = "YOUR_UPBIT_SECRET_KEY"
+ACCESS = ""
+SECRET = ""
 
 # === 파라미터 ===
 TICKER = "KRW-BTC"
@@ -173,10 +173,13 @@ def ema15_on_1min(df_index, cnt_extra=20):
 def can_sell(qty, ref_price):
     return (qty * ref_price) >= MIN_KRW_ORDER
 
-def sleep_to_next_minute(offset_sec=1):
+def sleep_to_next_minute(offset_sec=1.0):
     now = time.time()
-    sleep_s = 60 - (int(now) % 60) + offset_sec
-    time.sleep(max(1, sleep_s))
+    next_mark = (int(now // 60) + 1) * 60 + offset_sec  # 다음 분 + offset
+    sleep_s = next_mark - now
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+
 
 def fetch_balances():
     bals = safe_call(upbit.get_balances)
