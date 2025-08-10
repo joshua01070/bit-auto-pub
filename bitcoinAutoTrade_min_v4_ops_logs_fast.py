@@ -1,8 +1,9 @@
 # === bitcoinAutoTrade_min_v4_ops_logs_fast.py ===
 """
-v4 (ops + fills log + fast exits) + qty 8-dec normalization:
+v4 (ops + fills log + fast exits) + qty 8-dec normalization + minute-sync fix
 - 운영 안정화(1~6) + NDJSON 체결로그 + 분 동기화(진입) + intrabar 빠른 청산(FAST_POLL)
-- 주문 직전 수량을 업비트 호환 8자리로 정규화(q8), 초미세 라운드 업 방지용 safe_qty 적용
+- 주문 직전 수량 8자리 정규화(q8) + 초과 방지(safe_qty)
+- FAST 루프가 분 경계를 넘지 않도록 동적 슬립(2분 간격처럼 보이는 현상 방지)
 """
 import time, logging, json, os, atexit, sys, threading
 import pandas as pd
@@ -39,7 +40,6 @@ logging.info("=== v4 ops + fills log + fast exits start ===")
 _log_lock = threading.Lock()
 def _log_path():
     return f"fills_{time.strftime('%Y%m%d')}.ndjson"
-
 def log_exec(event, **kw):
     rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, **kw}
     try:
@@ -50,11 +50,8 @@ def log_exec(event, **kw):
 
 # === 수량 8자리 정규화 유틸 ===
 def q8(x: float) -> float:
-    """업비트 호환 8자리 라운드"""
     return float(f"{x:.8f}")
-
 def safe_qty(x: float, max_qty: float) -> float:
-    """라운드 후 초미세 초과 방지(클램프)"""
     y = q8(x)
     if y > max_qty:
         y = q8(max_qty - 1e-9)
@@ -62,7 +59,6 @@ def safe_qty(x: float, max_qty: float) -> float:
 
 # === 클라이언트/안전 호출 ===
 upbit = pyupbit.Upbit(ACCESS, SECRET)
-
 def safe_call(fn, *args, retries=3, base_wait=0.5, **kwargs):
     wait = base_wait
     for i in range(retries):
@@ -175,11 +171,10 @@ def can_sell(qty, ref_price):
 
 def sleep_to_next_minute(offset_sec=1.0):
     now = time.time()
-    next_mark = (int(now // 60) + 1) * 60 + offset_sec  # 다음 분 + offset
+    next_mark = (int(now // 60) + 1) * 60 + offset_sec
     sleep_s = next_mark - now
     if sleep_s > 0:
         time.sleep(sleep_s)
-
 
 def fetch_balances():
     bals = safe_call(upbit.get_balances)
@@ -209,7 +204,7 @@ def fetch_filled_volume(uuid):
 while True:
     # 1) 분 동기화(1분봉), 아니면 POLL_SECONDS 대기
     if INTERVAL == "minute1":
-        sleep_to_next_minute(offset_sec=1)
+        sleep_to_next_minute(offset_sec=1.0)
     else:
         time.sleep(POLL_SECONDS)
 
@@ -272,11 +267,21 @@ while True:
                 position.save()
                 logging.info(f"TRAIL UP (bar) @ {new_ts:.0f}")
 
-        # 7) 빠른 청산 루프: 다음 분 시작 직전까지 intrabar TP/TS
-        deadline = int(time.time() // 60) * 60 + 60 - 1
-        while time.time() < deadline:
+        # 7) 빠른 청산 루프: 다음 분 시작 '직전'까지 intrabar TP/TS (동적 슬립)
+        base = time.time()
+        next_min = (int(base // 60) + 1) * 60        # 이번 사이클의 '다음 분 00초'
+        deadline = next_min - 0.5                    # 경계 0.5초 전에는 루프 종료
+
+        while True:
+            now = time.time()
+            if now >= deadline:
+                break
+
             if position.total_qty <= 0:
-                time.sleep(FAST_POLL); continue
+                # 무포지션이면 가볍게 대기만
+                remain = deadline - time.time()
+                time.sleep(max(0.05, min(FAST_POLL, max(0.05, remain - 0.05))))
+                continue
 
             best_ask, best_bid = fetch_orderbook()
             avg = position.avg_price()
@@ -293,9 +298,7 @@ while True:
 
             # TP1
             if not position.tp1_done and best_bid >= avg * (1 + TP1_RATE):
-                # ★ 8자리 정규화 + 초과 방지
-                q1_raw = position.total_qty * TP1_PCT
-                q1 = safe_qty(q1_raw, position.total_qty)
+                q1 = safe_qty(position.total_qty * TP1_PCT, position.total_qty)
                 if can_sell(q1, best_bid) and q1 > 0:
                     safe_call(upbit.sell_market_order, TICKER, q1)
                     position.reduce_qty(q1)
@@ -307,8 +310,7 @@ while True:
                              avg_entry=avg, pos_qty=position.total_qty, tstop=position.trailing_stop)
                     logging.info(f"[FAST] TP1 SELL qty={q1:.8f}")
                     acted = True
-
-                    # (선택) TP1 직후 TP2 즉시 재평가를 넣고 싶으면 여기 추가
+                    # (원하면 여기서 TP2 즉시 재평가 추가 가능)
 
             # TP2
             elif position.tp1_done and best_bid >= avg * (1 + TP2_RATE):
@@ -334,7 +336,10 @@ while True:
                     position.save()
                     break
 
-            time.sleep(FAST_POLL if not acted else max(1, FAST_POLL // 2))
+            # 동적 슬립: 데드라인 넘지 않도록 캡
+            remain = deadline - time.time()
+            nap = FAST_POLL if not acted else max(1, FAST_POLL // 2)
+            time.sleep(max(0.05, min(nap, max(0.05, remain - 0.05))))
 
         position._err_count = 0
 
