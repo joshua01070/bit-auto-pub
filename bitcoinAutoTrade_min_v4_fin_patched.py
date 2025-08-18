@@ -1,13 +1,10 @@
 # === bitcoinAutoTrade_v4_fin_patched.py ===
 """
-v4_fin (final, locked & backtest-equal)
-- [중요] 거래 로직/조건/라운딩 정의는 '백테스트와 동일'하게 유지.
-- [추가] 공유 객체(position) 접근에 threading.Lock 적용 → 메인루프와 리콘실 워커의 경쟁 상태 방지.
-- [유지] MAX_ENTRIES 제거(백테스트와 규칙 일치). 재진입은 REENTRY_TH(가격 간격)로만 제어.
-- [유지] 매도(TP1/TP2/TS): 주문 후 '실제 체결량'을 조회해 상태에 반영(부분체결 안전).
-- [유지] 재진입 비교 기준: 최우선 매도호가(best_ask) 틱 상향(UP) 라운드.
-- [유지] 리콘실 워커: free+locked vs 내부 포지션 비교 경고.
-- [미세개선] 로그 일관성: 로그에 쓰이는 entries/remain 값을 모두 락 안에서 캡처해 출력.
+v4_fin (final, locked & backtest-equal, minimal patch)
+- 거래 로직/조건/라운딩 정의: 기존 그대로 유지 (백테스트와 동일).
+- [패치1] get_orderbook_best(): pyupbit 버전별 시그니처/키 차이를 흡수하는 호환 래퍼.
+- [패치2] ema15_on_1min(): '15T' → '15min' 로 변경(FutureWarning 제거).
+- 공유 객체(position) 접근은 기존대로 Lock으로 동기화(거래 로직 불변).
 """
 
 import os, sys, time, json, math, atexit, logging, threading
@@ -137,20 +134,42 @@ def get_ohlc_safe(interval="minute1", count=200) -> Optional[pd.DataFrame]:
             time.sleep(0.8)
     return None
 
+# >>> [패치1] pyupbit 버전 호환 래퍼 (시그니처/키 차이 흡수)
 def get_orderbook_best() -> Tuple[Optional[float], Optional[float]]:
+    """Return (best_ask, best_bid) across pyupbit versions."""
+    def _try_calls():
+        # 반환형: dict 또는 [dict] (버전별 혼재)
+        yield lambda: pyupbit.get_orderbook(TICKER)                # 옛 버전: 위치 인자
+        yield lambda: pyupbit.get_orderbook(ticker=TICKER)         # 옛 버전: 키워드 인자
+        yield lambda: pyupbit.get_orderbook([TICKER])              # 일부: 리스트 위치 인자
+        yield lambda: pyupbit.get_orderbook(tickers=[TICKER])      # 최신: tickers=[...]
     for _ in range(3):
-        try:
-            ob = pyupbit.get_orderbook(tickers=[TICKER]) or []
-            if not ob:
-                time.sleep(0.3); continue
-            unit = ob[0]['orderbook_units'][0]
-            ask = float(unit['ask_price'])
-            bid = float(unit['bid_price'])
-            return ask, bid
-        except Exception as e:
-            logging.warning(f"[WARN] get_orderbook error: {e}", exc_info=True)
-            time.sleep(0.3)
+        for call in _try_calls():
+            try:
+                ob = call()
+                if not ob:
+                    continue
+                data = ob[0] if isinstance(ob, (list, tuple)) else ob
+                # 키 이름 버전차 처리
+                units = data.get('orderbook_units') or data.get('orderbookUnits')
+                if not units:
+                    continue
+                u0 = units[0]
+                ask = u0.get('ask_price', u0.get('askPrice'))
+                bid = u0.get('bid_price', u0.get('bidPrice'))
+                if ask is None or bid is None:
+                    continue
+                return float(ask), float(bid)
+            except TypeError:
+                # 시그니처 불일치 → 다음 방식 시도
+                continue
+            except Exception as e:
+                logging.warning(f"[WARN] get_orderbook error: {e}", exc_info=True)
+                time.sleep(0.3)
+                break  # 동일 루프 내 재시도
+        time.sleep(0.3)
     return None, None
+# <<< [패치1 끝]
 
 def krw_balance() -> float:
     try:
@@ -215,11 +234,13 @@ def compute_indicators_1m(df_1m: pd.DataFrame) -> pd.DataFrame:
     df['target'] = df['open'] + df['ATR'].shift(1) * K
     return df
 
+# >>> [패치2] FutureWarning 제거: '15T' → '15min'
 def ema15_on_1min(df_1m: pd.DataFrame) -> pd.Series:
     # 15분 종가 → EMA(span=20) → 1분으로 ffill
-    df_15 = df_1m['close'].resample('15T').last()
+    df_15 = df_1m['close'].resample('15min').last()
     ema15 = df_15.ewm(span=EMA15_EMA_SPAN, adjust=False).mean()
     return ema15.reindex(df_1m.index, method='ffill')
+# <<< [패치2 끝]
 
 # ========== 상태/포지션 ==========
 class Position:
@@ -324,7 +345,7 @@ def reconcile_worker():
             # 비교/로깅
             krw_gap = abs(exch_btc - internal_btc) * best_bid
             if krw_gap >= (MIN_KRW_ORDER * 0.5):  # 노이즈 억제
-                logging.warning(f"[recon] mismatch: internal={internal_btc:.8f} exch={exch_btc:.8f} (≈{krw_gap:.0f} KRW)")
+                logging.warning(f"[recon] mismatch: internal={internal_btc:.8f} exch_btc={exch_btc:.8f} (≈{krw_gap:.0f} KRW)")
             time.sleep(600)
         except Exception as e:
             logging.warning(f"[recon] worker error: {e}", exc_info=True)
@@ -579,4 +600,3 @@ if __name__ == "__main__":
         main_loop()
     except KeyboardInterrupt:
         logging.info("[kill] interrupted by user")
-
