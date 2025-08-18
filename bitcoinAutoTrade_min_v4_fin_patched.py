@@ -572,6 +572,15 @@ def main_loop():
                 remain = deadline - time.time()
                 nap = FAST_POLL if not acted else max(1, FAST_POLL // 2)
                 time.sleep(max(0.05, min(nap, max(0.05, remain - 0.05))))
+            # --- 하트비트 보강: 루프 말미에서도 1분 간격 보장 (거래 로직 영향 없음) ---
+            if time.time() - hb_t0 >= HEARTBEAT_SEC:
+                with pos_lock:
+                    p_qty = position.total_qty
+                    p_avg = position.avg_price()
+                    p_tp1 = position.tp1_done
+                    p_ts  = position.trailing_stop
+                logging.info(f"[hb {now_kst().strftime('%H:%M:%S')}] pos={p_qty:.8f} avg={p_avg:.0f} tp1={p_tp1} ts={p_ts if p_ts else 0:.0f}")
+                hb_t0 = time.time()
 
         except Exception as e:
             # 루프 에러 관리 (연속 임계 시 백오프)
