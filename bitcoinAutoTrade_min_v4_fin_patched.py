@@ -1,4 +1,4 @@
-# === bitcoinAutoTrade_v4_fin_final_locked.py ===
+# === bitcoinAutoTrade_v4_fin_patched.py ===
 """
 v4_fin (final, locked & backtest-equal)
 - [중요] 거래 로직/조건/라운딩 정의는 '백테스트와 동일'하게 유지.
@@ -579,3 +579,4 @@ if __name__ == "__main__":
         main_loop()
     except KeyboardInterrupt:
         logging.info("[kill] interrupted by user")
+
