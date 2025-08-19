@@ -1,11 +1,13 @@
 # === bitcoinAutoTrade_v4_fin_patched.py ===
-"""
-v4_fin (final, locked & backtest-equal, minimal patch)
-- 거래 로직/조건/라운딩 정의: 기존 그대로 유지 (백테스트와 동일).
-- [패치1] get_orderbook_best(): pyupbit 버전별 시그니처/키 차이를 흡수하는 호환 래퍼.
-- [패치2] ema15_on_1min(): '15T' → '15min' 로 변경(FutureWarning 제거).
-- 공유 객체(position) 접근은 기존대로 Lock으로 동기화(거래 로직 불변).
-"""
+# 백테스트(v4_fin)와 진입 로직 동기화를 위해 4가지 사항이 수정된 버전 + 트레일 동기화 보완(A,B)
+# 1. 지표 계산(TR/ATR/target)을 백테스트와 동일하게 변경
+# 2. EMA15 계산 파이프라인을 백테스트와 동일하게 변경
+# 3. 전 분(t-2) 기준으로 진입 조건 판정 + target 라운딩(올림) 적용
+# 4. 재진입(피라미딩) 기준을 실시간 호가(ask) → 전 분 종가(close_prev)로 변경
+# ++ 패치A: 매수 직후 트레일링 스탑 초기화(백테스트 타이밍과 동일)
+# ++ 패치B: 전 분 고가 기반 1회 트레일 상향(TRAIL_UP_BAR) 반영
+# ++ 패치C: 체결량 0 반환 시 q8(0.0)로 일관화
+# ++ 패치D: 신호 성분 디버그 로그 추가
 
 import os, sys, time, json, math, atexit, logging, threading
 from datetime import datetime, timezone, timedelta
@@ -79,14 +81,16 @@ def price_unit(p: float) -> float:
     if p >=   100_000: return 50
     if p >=    10_000: return 10
     if p >=     1_000: return 5
-    return 1
+    # 백테스트 코드와의 호환성을 위해 1000원 미만 상세화
+    if p >=       100: return 1
+    if p >=        10: return 0.1
+    return 0.01
 
 def round_price(p: float, direction: str = "nearest") -> float:
     unit = price_unit(p)
     if direction == "down": return math.floor(p / unit) * unit
     if direction == "up":   return math.ceil(p / unit) * unit
-    # nearest (ties up)
-    return math.floor((p + unit * 0.5) / unit) * unit
+    return round(p / unit) * unit
 
 def ceil_price(p: float) -> float:
     return round_price(p, "up")
@@ -134,15 +138,13 @@ def get_ohlc_safe(interval="minute1", count=200) -> Optional[pd.DataFrame]:
             time.sleep(0.8)
     return None
 
-# >>> [패치1] pyupbit 버전 호환 래퍼 (시그니처/키 차이 흡수)
 def get_orderbook_best() -> Tuple[Optional[float], Optional[float]]:
     """Return (best_ask, best_bid) across pyupbit versions."""
     def _try_calls():
-        # 반환형: dict 또는 [dict] (버전별 혼재)
-        yield lambda: pyupbit.get_orderbook(TICKER)                # 옛 버전: 위치 인자
-        yield lambda: pyupbit.get_orderbook(ticker=TICKER)         # 옛 버전: 키워드 인자
-        yield lambda: pyupbit.get_orderbook([TICKER])              # 일부: 리스트 위치 인자
-        yield lambda: pyupbit.get_orderbook(tickers=[TICKER])      # 최신: tickers=[...]
+        yield lambda: pyupbit.get_orderbook(TICKER)
+        yield lambda: pyupbit.get_orderbook(ticker=TICKER)
+        yield lambda: pyupbit.get_orderbook([TICKER])
+        yield lambda: pyupbit.get_orderbook(tickers=[TICKER])
     for _ in range(3):
         for call in _try_calls():
             try:
@@ -150,7 +152,6 @@ def get_orderbook_best() -> Tuple[Optional[float], Optional[float]]:
                 if not ob:
                     continue
                 data = ob[0] if isinstance(ob, (list, tuple)) else ob
-                # 키 이름 버전차 처리
                 units = data.get('orderbook_units') or data.get('orderbookUnits')
                 if not units:
                     continue
@@ -161,15 +162,13 @@ def get_orderbook_best() -> Tuple[Optional[float], Optional[float]]:
                     continue
                 return float(ask), float(bid)
             except TypeError:
-                # 시그니처 불일치 → 다음 방식 시도
                 continue
             except Exception as e:
                 logging.warning(f"[WARN] get_orderbook error: {e}", exc_info=True)
                 time.sleep(0.3)
-                break  # 동일 루프 내 재시도
+                break
         time.sleep(0.3)
     return None, None
-# <<< [패치1 끝]
 
 def krw_balance() -> float:
     try:
@@ -195,7 +194,7 @@ def btc_total_balance() -> float:
 
 def fetch_filled_volume(uuid: Optional[str]) -> float:
     """주문 uuid로 실제 체결량 조회 (최대 ~2.5s 대기)"""
-    if not uuid: return 0.0
+    if not uuid: return q8(0.0)
     for _ in range(5):
         try:
             od = upbit.get_order(uuid)
@@ -205,47 +204,54 @@ def fetch_filled_volume(uuid: Optional[str]) -> float:
                 if trades:
                     filled = sum(float(t.get('volume', 0.0)) for t in trades)
                     return q8(filled)
-                if state in ['done', 'cancel']:  # 거래 없이 주문 종료
-                    return 0.0
+                if state in ['done', 'cancel']:
+                    return q8(0.0)
             time.sleep(0.5)
         except Exception as e:
             logging.warning(f"[WARN] get_order uuid={uuid} err: {e}", exc_info=True)
             time.sleep(0.5)
-    return 0.0
+    return q8(0.0)
 
 # ========== 지표 ==========
-def rsi(series: pd.Series, period: int) -> pd.Series:
-    delta = series.diff()
-    up, down = delta.clip(lower=0), -delta.clip(upper=0)
-    ma_up = up.rolling(period).mean()
-    ma_down = down.rolling(period).mean().replace(0, 1e-12)
-    return 100 - (100 / (1 + ma_up / ma_down))
 
-def compute_indicators_1m(df_1m: pd.DataFrame) -> pd.DataFrame:
-    df = df_1m.copy()
-    df['H-L'] = df['high'] - df['low']
-    df['H-C'] = (df['high'] - df['close']).abs()
-    df['L-C'] = (df['low'] - df['close']).abs()
-    tr = df[['H-L', 'H-C', 'L-C']].max(axis=1)
-    df['ATR'] = tr.rolling(ATR_PERIOD).mean()
-    df['RSI'] = rsi(df['close'], RSI_PERIOD)
+# [수정 1] 백테스트와 동일한 1분 지표 계산 함수
+def compute_indicators_1m_sync(df1m: pd.DataFrame, ATR_PERIOD: int, K: float, 
+                               RSI_PERIOD: int, MA_SHORT: int, MA_LONG: int) -> pd.DataFrame:
+    df = df1m.copy()
+    d = df['close'].diff()
+
+    # TR: 이전 종가 기준
+    df['H-L']  = df['high'] - df['low']
+    df['H-PC'] = (df['high'] - df['close'].shift(1)).abs()
+    df['L-PC'] = (df['low']  - df['close'].shift(1)).abs()
+    df['TR']   = df[['H-L','H-PC','L-PC']].max(axis=1)
+    df['ATR']  = df['TR'].rolling(ATR_PERIOD).mean()
+
+    # target: open + ATR.shift(1) * K  ← 반드시 shift(1)
+    df['target'] = df['open'] + df['ATR'].shift(1) * K
+
+    # RSI (단순 rolling, 소문자 컬럼명)
+    gain = d.clip(lower=0).rolling(RSI_PERIOD).mean()
+    loss = (-d.clip(upper=0)).rolling(RSI_PERIOD).mean().replace(0, 1e-12)
+    df['rsi'] = 100 - 100 / (1 + gain / loss)
+
+    # SMA
     df['ma_s'] = df['close'].rolling(MA_SHORT).mean()
     df['ma_l'] = df['close'].rolling(MA_LONG).mean()
-    df['target'] = df['open'] + df['ATR'].shift(1) * K
+    df.dropna(inplace=True)
     return df
 
-# >>> [패치2] FutureWarning 제거: '15T' → '15min'
-def ema15_on_1min(df_1m: pd.DataFrame) -> pd.Series:
-    # 15분 종가 → EMA(span=20) → 1분으로 ffill
-    df_15 = df_1m['close'].resample('15min').last()
-    ema15 = df_15.ewm(span=EMA15_EMA_SPAN, adjust=False).mean()
-    return ema15.reindex(df_1m.index, method='ffill')
-# <<< [패치2 끝]
+# [수정 2] 백테스트와 동일한 EMA15 브릿지 함수
+def ema15_on_1min_sync(df1m_index: pd.DatetimeIndex, 
+                       series_15m_close: pd.Series, span: int) -> pd.Series:
+    s15 = series_15m_close.tz_localize(None)         # 15분 close
+    s1m = s15.resample('1min').ffill()               # → 1분으로 ffill
+    ema1m = s1m.ewm(span=span, adjust=False).mean()  # → 1분 EMA
+    return ema1m.reindex(df1m_index, method='ffill')
 
 # ========== 상태/포지션 ==========
 class Position:
     def __init__(self):
-        # entries: List[(price, qty)]
         self.entries: List[Tuple[float, float]] = []
         self.tp1_done: bool = False
         self.trailing_stop: Optional[float] = None
@@ -315,7 +321,7 @@ class Position:
             return cls()
 
 position = Position.load()
-pos_lock = threading.Lock()   # 공유 상태 락
+pos_lock = threading.Lock()
 
 # ========== 체결/수량 보정 ==========
 def can_buy(krw: float) -> bool:
@@ -335,16 +341,13 @@ def min_sell_qty(cur_px: float, min_krw: float) -> float:
 def reconcile_worker():
     while True:
         try:
-            # 내부 상태 스냅샷(락)
             with pos_lock:
                 internal_btc = position.total_qty
-            # 거래소/시세(API, 락 밖)
             exch_btc = btc_total_balance()
             ask, bid = get_orderbook_best()
             best_bid = float(bid or 0.0)
-            # 비교/로깅
             krw_gap = abs(exch_btc - internal_btc) * best_bid
-            if krw_gap >= (MIN_KRW_ORDER * 0.5):  # 노이즈 억제
+            if krw_gap >= (MIN_KRW_ORDER * 0.5):
                 logging.warning(f"[recon] mismatch: internal={internal_btc:.8f} exch_btc={exch_btc:.8f} (≈{krw_gap:.0f} KRW)")
             time.sleep(600)
         except Exception as e:
@@ -367,117 +370,133 @@ def main_loop():
     hb_t0 = time.time()
 
     while True:
-        # 분 동기화
         if INTERVAL == "minute1":
             sleep_to_next_minute(offset_sec=1.0)
         else:
             time.sleep(POLL_SECONDS)
 
-        # 하트비트(락으로 스냅샷)
         if time.time() - hb_t0 >= HEARTBEAT_SEC:
             with pos_lock:
-                p_qty = position.total_qty
-                p_avg = position.avg_price()
-                p_tp1 = position.tp1_done
-                p_ts  = position.trailing_stop
-            logging.info(f"[hb {now_kst().strftime('%H:%M:%S')}] pos={p_qty:.8f} avg={p_avg:.0f} tp1={p_tp1} ts={p_ts if p_ts else 0:.0f}")
+                p_qty, p_avg, p_tp1, p_ts = position.total_qty, position.avg_price(), position.tp1_done, position.trailing_stop
+            logging.info(f"[hb {now_kst().strftime('%H:%M:%S')}] pos={p_qty:.8f} avg={p_avg:.0f} tp1={p_tp1} ts={(p_ts if p_ts else 0):.0f}")
             hb_t0 = time.time()
 
         try:
             # 1) 시세/지표 (전 분 기준)
-            df = get_ohlc_safe("minute1", max(200, WARMUP + 10))
-            if df is None:
+            df_1m_raw = get_ohlc_safe("minute1", max(200, WARMUP + 10))
+            if df_1m_raw is None:
                 continue
-            df = compute_indicators_1m(df)
-            ema15 = ema15_on_1min(df)
+            
+            # [수정 1, 2 적용] 백테스트와 동일한 지표/EMA 계산
+            df_ind = compute_indicators_1m_sync(df_1m_raw, ATR_PERIOD, K, RSI_PERIOD, MA_SHORT, MA_LONG)
+            df_15m_close = df_1m_raw['close'].resample('15min').last()
+            ema15_sync = ema15_on_1min_sync(df_ind.index, df_15m_close, span=EMA15_EMA_SPAN)
 
-            # 전 분(신호 판단), 다음 분(체결)
-            row_prev = df.iloc[-2]
-            ema_prev = float(ema15.iloc[-2])
+            # [수정 3] 전 분(t-2)에서 엔트리 조건 판정
+            row_prev = df_ind.iloc[-2]
+            close_prev = float(row_prev['close'])
+            tgt_up = round_price(float(row_prev['target']), "up")  # 비교 전에 올림
+            rsi_prev = float(row_prev['rsi'])                      # 소문자 rsi 사용
+            ma_s_prev = float(row_prev['ma_s'])
+            ma_l_prev = float(row_prev['ma_l'])
+            ema15_prev = float(ema15_sync.iloc[-2])
 
-            close = float(row_prev['close'])
-            tgt_up = ceil_price(float(row_prev['target']))
-            mas = float(row_prev['ma_s'])
-            mal = float(row_prev['ma_l'])
-            rsi_v = float(row_prev['RSI'])
+            buy_cond = (
+                (close_prev > tgt_up) and
+                (rsi_prev < RSI_THRESHOLD) and
+                (ma_s_prev > ma_l_prev) and
+                (close_prev > ema15_prev)
+            )
 
-            buy_cond = (close > tgt_up) and (rsi_v < RSI_THRESHOLD) and (mas > mal) and (close > ema_prev)
+            if buy_cond:
+                # [패치D] 신호 성분 로그
+                logging.info(
+                    f"[SIGNAL] close_prev={close_prev:.0f} > tgt_up={tgt_up:.0f}, "
+                    f"RSI={rsi_prev:.2f}<{RSI_THRESHOLD}, MA {ma_s_prev:.0f}>{ma_l_prev:.0f}, "
+                    f"EMA15={ema15_prev:.0f}"
+                )
 
-            # 2) 다음 분 시작 → 호가 기반 체결/재진입 판단
+            # 2) 다음 분 시작 → 호가 조회 및 재진입 판단
             ask, bid = get_orderbook_best()
             if ask is None or bid is None:
                 continue
 
-            # 재진입 허용 여부 (None이면 필터 OFF → 재진입 허용)
-            allow_reentry_price = round_price(ask, "up")
             with pos_lock:
                 cur_qty = position.total_qty
                 cur_avg = position.avg_price()
+
+            # [수정 4] 재진입(피라미딩) 기준가격을 전 분 종가로 변경
             allow_reentry = (
-                (cur_qty == 0) or
+                (cur_qty <= 0) or
                 (REENTRY_TH is None) or
-                (allow_reentry_price >= cur_avg * (1.0 + REENTRY_TH))
+                (close_prev > cur_avg * (1.0 + REENTRY_TH))
             )
 
-            # (선택) 총 포지션 상한 체크
             if MAX_POSITION_KRW is not None:
                 pos_val_krw = cur_qty * float(bid or 0.0)
                 if pos_val_krw > MAX_POSITION_KRW:
                     allow_reentry = False
 
-            # 매수액 산출
             krw = krw_balance()
             buy_cap = krw * (BUY_PCT if BUY_PCT is not None else 1.0)
             if BUY_KRW_CAP is not None:
                 buy_cap = min(buy_cap, float(BUY_KRW_CAP))
             buy_amt = buy_cap * (1 - FEE)
 
-            # --- 주문(API, 락 밖) ---
             if buy_cond and allow_reentry and can_buy(buy_amt):
                 order = safe_call(upbit.buy_market_order, TICKER, buy_amt)
                 uuid = order.get('uuid') if isinstance(order, dict) else None
                 filled = fetch_filled_volume(uuid)
-                if filled <= 0:  # 폴백: 보수적 추정
-                    filled = (buy_amt / max(ask, 1e-8)) * (1.0 - FEE)
-                entry_px = round_price(ask, "up")
+                entry_px = round_price(ask, "up")  # 체결가는 실시간 호가 사용(유지)
+                if filled <= 0:
+                    filled = (buy_amt / max(entry_px, 1e-8)) * (1.0 - FEE)
                 qty = q8(filled)
-                # --- 상태 갱신(락) + 로그용 entries_len 캡처 ---
                 if qty > 0:
                     with pos_lock:
                         position.add_entry(entry_px, qty)
-                        entries_len = len(position.entries)  # 로그용 캡처
+                        entries_len = len(position.entries)
                         position.save()
                     logging.info(f"[BUY] krw={buy_amt:.0f} qty={qty} px={entry_px} entries={entries_len}")
 
-            # 3) FAST intrabar: 다음 분 0.5초 전까지 TP/TS 관리
+                    # [패치A] 매수 직후 TS 초기화 (백테스터와 동일 타이밍)
+                    step0 = TRAILING_STEP_AFTER_TP1 if position.tp1_done else TRAILING_STEP
+                    ts0 = round_price(entry_px * (1 - step0), "down")
+                    with pos_lock:
+                        position.trailing_stop = max(position.trailing_stop or 0.0, ts0)
+                        position.save()
+                    logging.info(f"[INIT TS] set to {ts0:.0f} after BUY")
+
+            # [패치B] BAR 기반 1회 트레일 상향 (전 분 high 기준)
+            with pos_lock:
+                if position.total_qty > 0:
+                    step_now = TRAILING_STEP_AFTER_TP1 if position.tp1_done else TRAILING_STEP
+                    ts_bar = round_price(float(row_prev['high']) * (1 - step_now), "down")
+                    if ts_bar > (position.trailing_stop or 0.0):
+                        position.trailing_stop = ts_bar
+                        position.save()
+                        logging.info(f"[BAR] TRAIL UP prev_high → {ts_bar:.0f}")
+
+            # 3) FAST intrabar: 다음 분 0.5초 전까지 TP/TS 관리 (로직 유지)
             next_min = (int(time.time() // 60) + 1) * 60
             deadline = next_min - 0.5
 
             while True:
-                now = time.time()
-                if now >= deadline:
-                    break
-                # 포지션 유무 스냅샷(락)
+                if time.time() >= deadline: break
+                
                 with pos_lock:
                     qty_total = position.total_qty
-                if qty_total <= 0:
-                    break
+                if qty_total <= 0: break
 
                 ask, bid = get_orderbook_best()
                 if ask is None or bid is None:
-                    time.sleep(0.3)
-                    continue
+                    time.sleep(0.3); continue
 
-                # 스냅샷: avg/tp1/ts(락)
                 with pos_lock:
-                    avg = position.avg_price()
-                    tp1_done = position.tp1_done
-                    cur_ts   = position.trailing_stop
+                    avg, tp1_done, cur_ts = position.avg_price(), position.tp1_done, position.trailing_stop
 
                 bid_high = round_price(bid, "down")
                 acted = False
 
-                # ① intrabar 트레일 상향(호가 기준)
                 step = TRAILING_STEP_AFTER_TP1 if tp1_done else TRAILING_STEP
                 new_ts = round_price(bid_high * (1 - step), "down")
                 if new_ts > (cur_ts or 0.0):
@@ -487,39 +506,30 @@ def main_loop():
                             position.save()
                     logging.info(f"[FAST] TRAIL UP @ {new_ts:.0f}")
 
-                # ② TP1 (실체결량 반영)
                 if (not tp1_done) and (bid_high >= avg * (1 + TP1_RATE)):
-                    with pos_lock:
-                        q_total = position.total_qty
+                    with pos_lock: q_total = position.total_qty
                     q1_raw = safe_qty(q_total * TP1_PCT, q_total)
-                    # 잔량이 최소주문 미만이면 전량으로 조정
                     if (q_total - q1_raw) < min_sell_qty(bid_high, MIN_KRW_ORDER):
                         q1 = q_total
                     else:
                         q1 = q1_raw
-
                     if can_sell(q1, bid_high) and q1 > 0:
-                        # 주문/API (락 밖)
                         order = safe_call(upbit.sell_market_order, TICKER, q1)
                         uuid = order.get('uuid') if isinstance(order, dict) else None
                         filled_qty = fetch_filled_volume(uuid)
                         if filled_qty > 0:
-                            # 상태 갱신(락) + 로그용 remain_qty 캡처
                             with pos_lock:
                                 position.reduce_qty(filled_qty)
                                 position.tp1_done = True
                                 be_floor = round_price(avg * (1 + FEE*2 + 0.001), "up")
                                 position.trailing_stop = max(position.trailing_stop or 0.0, be_floor)
                                 position.save()
-                                remain_qty = position.total_qty  # 로그용 캡처
+                                remain_qty = position.total_qty
                             logging.info(f"[FAST] TP1 SELL filled={filled_qty:.8f} remain={remain_qty:.8f}")
                             acted = True
 
-                # ③ TP2 (실체결량 반영, 부분체결 안전화)
                 with pos_lock:
-                    qty_total = position.total_qty
-                    tp1_done  = position.tp1_done
-                    avg       = position.avg_price()
+                    qty_total, tp1_done, avg = position.total_qty, position.tp1_done, position.avg_price()
                 if qty_total > 0 and tp1_done and bid_high >= avg * (1 + TP2_RATE):
                     qty_all = qty_total
                     if can_sell(qty_all, bid_high) and qty_all > 0:
@@ -529,23 +539,15 @@ def main_loop():
                         if filled > 0:
                             if filled >= qty_all * 0.999:
                                 logging.info(f"[FAST] TP2 SELL qty={qty_all:.8f}")
-                                with pos_lock:
-                                    position.clear()
-                                    position.save()
-                                acted = True
-                                break
+                                with pos_lock: position.clear(); position.save()
+                                acted = True; break
                             else:
-                                with pos_lock:
-                                    position.reduce_qty(filled)
-                                    position.save()
-                                    remain_qty = position.total_qty  # 로그용 캡처
-                                logging.info(f"[FAST] TP2 PARTIAL filled={filled:.8f}, remain={remain_qty:.8f}")
-                                acted = True  # 전량 미체결 → 루프 계속
+                                with pos_lock: position.reduce_qty(filled); position.save()
+                                logging.info(f"[FAST] TP2 PARTIAL filled={filled:.8f}, remain={position.total_qty:.8f}")
+                                acted = True
 
-                # ④ Trailing Stop (실체결량 반영, 부분체결 안전화)
                 with pos_lock:
-                    qty_total = position.total_qty
-                    cur_ts    = position.trailing_stop
+                    qty_total, cur_ts = position.total_qty, position.trailing_stop
                 if qty_total > 0 and cur_ts is not None and bid_high <= cur_ts:
                     qty_all = qty_total
                     if can_sell(qty_all, bid_high) and qty_all > 0:
@@ -555,43 +557,31 @@ def main_loop():
                         if filled > 0:
                             if filled >= qty_all * 0.999:
                                 logging.info(f"[FAST] TRAIL STOP SELL qty={qty_all:.8f}")
-                                with pos_lock:
-                                    position.clear()
-                                    position.save()
-                                acted = True
-                                break
+                                with pos_lock: position.clear(); position.save()
+                                acted = True; break
                             else:
-                                with pos_lock:
-                                    position.reduce_qty(filled)
-                                    position.save()
-                                    remain_qty = position.total_qty  # 로그용 캡처
-                                logging.info(f"[FAST] TS PARTIAL filled={filled:.8f}, remain={remain_qty:.8f}")
-                                acted = True  # 전량 미체결 → 루프 계속
+                                with pos_lock: position.reduce_qty(filled); position.save()
+                                logging.info(f"[FAST] TS PARTIAL filled={filled:.8f}, remain={position.total_qty:.8f}")
+                                acted = True
 
-                # 동적 슬립
                 remain = deadline - time.time()
                 nap = FAST_POLL if not acted else max(1, FAST_POLL // 2)
                 time.sleep(max(0.05, min(nap, max(0.05, remain - 0.05))))
-            # --- 하트비트 보강: 루프 말미에서도 1분 간격 보장 (거래 로직 영향 없음) ---
+            
             if time.time() - hb_t0 >= HEARTBEAT_SEC:
                 with pos_lock:
-                    p_qty = position.total_qty
-                    p_avg = position.avg_price()
-                    p_tp1 = position.tp1_done
-                    p_ts  = position.trailing_stop
-                logging.info(f"[hb {now_kst().strftime('%H:%M:%S')}] pos={p_qty:.8f} avg={p_avg:.0f} tp1={p_tp1} ts={p_ts if p_ts else 0:.0f}")
+                    p_qty, p_avg, p_tp1, p_ts = position.total_qty, position.avg_price(), position.tp1_done, position.trailing_stop
+                logging.info(f"[hb {now_kst().strftime('%H:%M:%S')}] pos={p_qty:.8f} avg={p_avg:.0f} tp1={p_tp1} ts={(p_ts if p_ts else 0):.0f}")
                 hb_t0 = time.time()
 
         except Exception as e:
-            # 루프 에러 관리 (연속 임계 시 백오프)
             with pos_lock:
                 position._err_count = getattr(position, "_err_count", 0) + 1
                 err_no = position._err_count
             logging.error(f"Main loop error #{err_no}", exc_info=True)
             if err_no >= CRIT_ERR_THRESHOLD:
                 logging.critical("[CRIT] too many errors, backing off 10s")
-                with pos_lock:
-                    position._err_count = 0
+                with pos_lock: position._err_count = 0
                 time.sleep(10)
             continue
         else:
@@ -602,7 +592,6 @@ def main_loop():
 if __name__ == "__main__":
     setup_logging()
     atexit.register(on_exit)
-    # 리콘실리에이션 워커 시작
     recon_thread = threading.Thread(target=reconcile_worker, daemon=True)
     recon_thread.start()
     try:
