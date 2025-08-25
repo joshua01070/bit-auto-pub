@@ -570,6 +570,9 @@ def main_loop():
                         logging.warning(f"[{ticker}] BUY fill uncertain → using estimate {est:.8f}")
                         filled = est
 
+                    if avg_fill_px:
+                        entry_px = round_price(float(avg_fill_px), "up")
+
                     qty = q8(filled)
                     if qty > 0:
                         with pos_lock:
