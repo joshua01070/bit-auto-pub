@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_coin_auto_trade.py (LIVE only, no dry-run, multi-symbol)
+multi_coin_auto_trade_live_final.py (LIVE only, no dry-run, multi-symbol)
 
-Applied:
+Applied (stability set):
   (A) 체결 리콘실리에이션: uuid→get_order(trades)→잔고 델타 fallback
   (B) pyupbit timeout=4s 몽키패치
   (C) 하트비트 워치독(20s) + 루프 하트비트(60s)
   (F) safe_call 재시도/백오프 래퍼
   (G) 오더북 호환 래퍼
 
-Parity updates (this build):
-  - [PTP]  분할매도 기준을 "초기 진입 수량"으로 통일(마지막 레벨은 잔량 전량)
+Parity & safety:
+  - [PTP] 분할매도 기준 = "초기 진입 수량"(마지막 레벨은 잔량 전량)
   - [ENTRY] Donchian upper(직전 N봉) + 2틱 버퍼(prev_close > upper + 2*tick)
-  - [DUST] 마지막 청산(TS/마지막 PTP/TP) 시 minKRW 검사 우회 +倒數2(마지막 전) 레벨에서 dust 사전 흡수
+  - [TICK] 틱사이즈 테이블을 백테스터와 동일화(≥1,000원 구간 5원)
+  - [BE-GATE] BE(본전 스탑)는 TP1 이후에만 활성(즉시 손절 루프 방지)
+  - [FAST-SEQ] HL/LH 순서 스위치(기본 HL: PTP/TP→TS)
 
-Signal/Exec:
-  - 닫힌 5분봉 prev_close > DonchianUpper(prev N) + 2 ticks
-  - (옵션) MA 필터(ms>ml)
-  - PTP: 마지막 레벨은 '잔량 전량', 매도 전 최소주문금액 검사(전량일 때는 우회 시도)
-  - TP1 체결 후 BE(본전 스탑)로 즉시 끌어올림 (avg*(1+fee+eps) 이상)
-  - TS: 앵커(ask) 기반 상향 (고정 스텝)
-  - HALT: halt.flag 존재 시 신규 매수만 차단(청산은 허용)
-  - LIVE 가드: UPBIT_LIVE=1 없으면 즉시 종료
-  - 멀티코인 예산: 루프마다 KRW 잔고로 budget_left를 계산해 진입 시 차감(경합 방지)
+Dust hybrid (this build):
+  - [ENTRY-UNLOCK] dust 상태여도 다음 시그널에서 신규 매수 허용(엔트리 봉인 해제)
+  - [PTP-PREVENT] 분할매도 시 "남길 잔량 ≥ 최저매도수량(minKRW/price)"을 사전 보장
+  - [SKIP-IF-DUST] 인트라바에서 dust면 청산 로직 스킵(로그 스팸/거래소 거절 회피)
+  - 상태 강제 초기화(clear state) 방식은 제거(문맥 보존)
 """
 
 import os, sys, time, json, math, logging, threading
@@ -67,7 +65,11 @@ DEFAULTS = dict(
     ptp_levels = "",           # 기본은 BASE(분할 없음)
     tp_rate = 0.0,             # 기본 0(PTP 전용 코인 제외)
     eps_exec = 0.0003,         # BE/사이징 보수 여유
-    entry_tick_buffer = 2,     # ★ 2틱 버퍼(백테스터와 일치)
+    entry_tick_buffer = 2,     # 2틱 버퍼(백테스터와 일치)
+    fast_seq = "HL",           # PTP/TP → TS (LH면 TS→PTP/TP)
+
+    # --- dust 하이브리드 ---
+    dust_margin = 0.98,        # dust 판단 여유(0.95~1.00 권장)
 )
 
 # 채택안 반영 (코인별 오버라이드)
@@ -75,22 +77,24 @@ SYMBOL_PARAMS: Dict[str, Dict[str, Any]] = {
     "KRW-BTC": {
         "use_ma": 1, "ma_s": 10, "ma_l": 60,
         "don_n": 72,
-        "fee": 0.0007,
+        "fee": 0.0005,
         "buy_pct": 0.40,
         "trail_before": 0.08, "trail_after": 0.08,   # 고정 트레일
         "ptp_levels": "",                            # BASE
         "tp_rate": 0.035,                            # 단일 TP
         "entry_tick_buffer": 2,
+        "fast_seq": "HL",
     },
     "KRW-ETH": {
         "use_ma": 1, "ma_s": 10, "ma_l": 30,
         "don_n": 72,
-        "fee": 0.0007,
+        "fee": 0.0005,
         "buy_pct": 0.30,
         "trail_before": 0.075, "trail_after": 0.075, # 고정 트레일
         "ptp_levels": "0.015:0.4,0.035:0.3,0.06:0.3",
         "tp_rate": 0.03,                             # 잔량 단일 TP
         "entry_tick_buffer": 2,
+        "fast_seq": "HL",
     },
 }
 
@@ -112,13 +116,14 @@ def sym_to_ccy(symbol: str) -> str:
     return symbol.split("-")[1]
 
 def tick_size_for(krw_price: float) -> float:
+    """백테스터와 동등: ≥1,000 구간은 5원."""
     p = krw_price
     if p >= 2_000_000: return 1000
     if p >= 1_000_000: return 500
     if p >=   500_000: return 100
     if p >=   100_000: return 50
     if p >=    10_000: return 10
-    if p >=     1_000: return 1
+    if p >=     1_000: return 5     # ← 1원 → 5원
     if p >=       100: return 0.1
     if p >=        10: return 0.01
     return 0.001
@@ -293,7 +298,7 @@ class PositionState:
     ts_anchor: float = 0.0
     ptp_hits: List[float] = None
     tp1_done: bool = False
-    init_qty: float = 0.0         # ★ 초기 진입 수량(PTP 기준)
+    init_qty: float = 0.0         # 초기 진입 수량(PTP 기준)
 
     def to_json(self) -> dict:
         d = asdict(self)
@@ -348,6 +353,18 @@ class SymbolStrategy:
         if len(series) < n: return None
         return float(series.iloc[-n:].mean())
 
+    # --- dust helpers ---
+    def _is_dust_with_price(self, px: float) -> bool:
+        """px(종가/호가)로 평가 시 포지션 KRW 가치가 최소주문 미만인지."""
+        if not self.state.has_pos:
+            return False
+        return (self.state.qty * px) < (self.p["min_krw_order"] * float(self.p.get("dust_margin", 0.98)))
+
+    def _min_sell_qty(self, bid: float) -> float:
+        """현재 호가에서 한 번에 팔 수 있는 '최저 매도 수량'(step 반영)."""
+        q = (self.p["min_krw_order"] / max(bid, 1e-8)) * float(self.p.get("dust_margin", 0.98))
+        return max(self.p["qty_step"], floor_to_step(q, self.p["qty_step"]))
+
     # trading helpers
     def _try_sell_qty(self, qty: float, bid: float, force: bool = False) -> bool:
         """force=True면 minKRW 검사를 우회(마지막 전량 청산 시도). 거래소가 거부할 수는 있음."""
@@ -377,18 +394,28 @@ class SymbolStrategy:
         self.state.has_pos = True
         self.state.qty = qty
         self.state.avg = avg
+
         # 초기 진입 수량 복원(재기동 시 fallback)
         if self.state.init_qty <= 0:
             self.state.init_qty = qty
-        # anchor/stop 초기화: BE와 트레일 중 더 높은 쪽 (No-Loosen)
+
+        # anchor/stop 초기화: BE는 TP1 이후에만 적용 (No-Loosen)
         step = self.p["trail_after"] if self.state.tp1_done else self.p["trail_before"]
         if self.state.ts_anchor <= 0:
             self.state.ts_anchor = self.state.avg
-        be = be_stop(self.state.avg, self.p["fee"], self.p["eps_exec"])
+
         trail_stop = round_to_tick(self.state.ts_anchor * (1.0 - step))
-        new_stop = max(be, trail_stop)
+        new_stop = trail_stop
+
+        # ★ BE는 TP1 이후에만
+        if self.state.tp1_done:
+            be = be_stop(self.state.avg, self.p["fee"], self.p["eps_exec"])
+            new_stop = max(new_stop, be)
+
+        # stop은 절대 느슨해지지 않음
         if self.state.stop <= 0 or new_stop > self.state.stop:
             self.state.stop = new_stop
+
         if self.state.ptp_hits is None:
             self.state.ptp_hits = []
         self._save_state()
@@ -432,7 +459,7 @@ class SymbolStrategy:
                 logging.warning(f"[{self.symbol}] [FILL] uncertain(no uuid) → using estimate")
 
         self._refresh_position_from_exchange()
-        # ★ 초기 진입 수량 확정
+        # 초기 진입 수량 확정
         self.state.init_qty = self.state.qty
         self._save_state()
 
@@ -455,10 +482,12 @@ class SymbolStrategy:
             if ms is None or ml is None or ms <= ml:
                 return budget_left
 
-        # ★ Entry: prev_close > upper + tick*buffer (백테스트와 동일: '>')
+        # Entry: prev_close > upper + tick*buffer ('>')
         tick = tick_size_for(upper)
         up_buf = upper + tick * int(self.p.get("entry_tick_buffer", 2))
-        if (not self.state.has_pos) and (not halted()) and (prev_close > up_buf):
+
+        # has_pos=False 또는 dust면 신규 매수 허용
+        if ((not self.state.has_pos) or self._is_dust_with_price(prev_close)) and (not halted()) and (prev_close > up_buf):
             budget_left = self._enter_position(budget_left)
         return budget_left
 
@@ -510,9 +539,12 @@ class SymbolStrategy:
         if not self.state.has_pos:
             return
 
-        step = self.p["trail_after"] if self.state.tp1_done else self.p["trail_before"]
+        # ★ dust면 청산 로직을 시도하지 않고 대기(다음 엔트리 때 합쳐 처리)
+        if self._is_dust_with_price(bid):
+            return
 
-        # 앵커 상향 (ask 기준) & stop No-Loosen
+        # 트레일 앵커 상향(ask 기준) + No-Loosen
+        step = self.p["trail_after"] if self.state.tp1_done else self.p["trail_before"]
         if ask > self.state.ts_anchor:
             self.state.ts_anchor = ask
             new_stop = round_to_tick(self.state.ts_anchor * (1.0 - step))
@@ -521,62 +553,87 @@ class SymbolStrategy:
                 logging.info(f"[{self.symbol}] [TRAIL UP] anchor={self.state.ts_anchor:.0f} stop={self.state.stop:.0f}")
                 self._save_state()
 
-        # TS 체결 (LH: TS가 PTP/TP보다 우선) — 마지막 전량: minKRW 우회(force=True)
-        if bid <= self.state.stop:
-            qty = self.state.qty
-            if self._try_sell_qty(qty, bid, force=True):
-                logging.info(f"[{self.symbol}] [TS EXIT] all-out by trailing stop")
-                self.state = PositionState(has_pos=False, ptp_hits=[])
-                self._save_state()
-            return
+        # --- 액션 함수들 ---
+        def do_ts():
+            if bid <= self.state.stop:
+                qty = self.state.qty
+                if self._try_sell_qty(qty, bid, force=True):
+                    logging.info(f"[{self.symbol}] [TS EXIT] all-out by trailing stop")
+                    self.state = PositionState(has_pos=False, ptp_hits=[])
+                    self._save_state()
+                return True
+            return False
 
-        # PTP (있다면) — 초기 수량 기준, 마지막 전에서 dust 흡수
-        if self.ptp_levels and self.state.qty > 0:
-            cur = bid
-            base = self.state.init_qty if self.state.init_qty > 0 else self.state.qty
-            for i, (lv, pct) in enumerate(self.ptp_levels):
-                if self.state.ptp_hits and (lv in self.state.ptp_hits):
-                    continue
-                target = self.state.avg * (1.0 + lv)
-                if cur >= target:
-                    is_last = (i == len(self.ptp_levels) - 1)
-                    qty_part = self.state.qty if is_last else base * pct
-                    qty_part = min(qty_part, self.state.qty)
-                    # 倒數2 레벨에서 dust 사전 흡수
-                    if (not is_last):
-                        rem_after = self.state.qty - qty_part
-                        if (rem_after * bid) < self.p["min_krw_order"]:
-                            qty_part = self.state.qty
-                            is_last = True  # 이번에 전량 처리
-                    qty_part = floor_to_step(qty_part, self.p["qty_step"])
-                    if qty_part <= 0:
-                        self.state.ptp_hits = list(set((self.state.ptp_hits or []) + [lv]))
-                        self._save_state()
+        def do_ptp_and_tp():
+            # PTP (초기 진입 수량 기준) + dust 사전 차단
+            if self.ptp_levels and self.state.qty > 0:
+                base = self.state.init_qty if self.state.init_qty > 0 else self.state.qty
+                min_q = self._min_sell_qty(bid)  # 한 번에 팔 수 있는 최소 수량
+
+                for i, (lv, pct) in enumerate(self.ptp_levels):
+                    if self.state.ptp_hits and (lv in self.state.ptp_hits):
                         continue
+                    target = self.state.avg * (1.0 + lv)
+                    if bid >= target:
+                        is_last = (i == len(self.ptp_levels) - 1)
 
-                    if self._try_sell_qty(qty_part, bid, force=is_last):
-                        self.state.qty = max(0.0, self.state.qty - qty_part)
-                        if (self.state.ptp_hits is None):
-                            self.state.ptp_hits = []
-                        if lv not in self.state.ptp_hits:
-                            self.state.ptp_hits.append(lv)
-                        if not self.state.tp1_done:
-                            self.state.tp1_done = True
-                            self._after_tp1_bump_be()
+                        # 계획 수량
+                        qty_part = self.state.qty if is_last else base * pct
+                        qty_part = min(qty_part, self.state.qty)
 
-                        if self.state.qty <= 0:
-                            logging.info(f"[{self.symbol}] [PTP EXIT] all-out by last PTP level")
-                            self.state = PositionState(has_pos=False, ptp_hits=[])
-                        self._save_state()
+                        # ★ 사전 차단: 남길 잔량이 min_q 미만이면 이번 단계에서 조정/전량
+                        if not is_last:
+                            rem_after = self.state.qty - qty_part
+                            if rem_after < min_q:
+                                qty_part = max(0.0, self.state.qty - min_q)
+                                if qty_part <= 0:
+                                    qty_part = self.state.qty
+                                    is_last = True
 
-        # 단일 TP (잔량 정리; BTC=전체, ETH=PTP 이후 잔량) — 마지막 전량: force=True
-        tp_rate = float(self.p.get("tp_rate") or 0.0)
-        if self.state.qty > 0 and tp_rate > 0.0 and bid >= self.state.avg * (1.0 + tp_rate):
-            if self._try_sell_qty(self.state.qty, bid, force=True):
-                logging.info(f"[{self.symbol}] [TP EXIT] all-out by TP {tp_rate:.4f}")
-                self.state = PositionState(has_pos=False, ptp_hits=[])
-                self._save_state()
-            return
+                        # (보강)倒數2 dust 흡수(극단 케이스)
+                        if not is_last:
+                            rem_after = self.state.qty - qty_part
+                            if (rem_after * bid) < self.p["min_krw_order"]:
+                                qty_part = self.state.qty
+                                is_last = True
+
+                        qty_part = floor_to_step(qty_part, self.p["qty_step"])
+                        if qty_part <= 0:
+                            self.state.ptp_hits = list(set((self.state.ptp_hits or []) + [lv]))
+                            self._save_state()
+                            continue
+
+                        if self._try_sell_qty(qty_part, bid, force=is_last):
+                            self.state.qty = max(0.0, self.state.qty - qty_part)
+                            if self.state.ptp_hits is None:
+                                self.state.ptp_hits = []
+                            if lv not in self.state.ptp_hits:
+                                self.state.ptp_hits.append(lv)
+                            if not self.state.tp1_done:
+                                self.state.tp1_done = True
+                                self._after_tp1_bump_be()
+                            if self.state.qty <= 0:
+                                logging.info(f"[{self.symbol}] [PTP EXIT] all-out by last PTP level")
+                                self.state = PositionState(has_pos=False, ptp_hits=[])
+                            self._save_state()
+
+            # 단일 TP (잔량 전량)
+            tp_rate = float(self.p.get("tp_rate") or 0.0)
+            if self.state.qty > 0 and tp_rate > 0.0 and bid >= self.state.avg * (1.0 + tp_rate):
+                if self._try_sell_qty(self.state.qty, bid, force=True):
+                    logging.info(f"[{self.symbol}] [TP EXIT] all-out by TP {tp_rate:.4f}")
+                    self.state = PositionState(has_pos=False, ptp_hits=[])
+                    self._save_state()
+                return True
+            return False
+
+        # FAST-SEQ 적용
+        if (self.p.get("fast_seq", "HL").upper() == "HL"):
+            if do_ptp_and_tp(): return
+            if do_ts(): return
+        else:
+            if do_ts(): return
+            if do_ptp_and_tp(): return
 
 # =========================
 # 6) 하트비트/메인 루프
