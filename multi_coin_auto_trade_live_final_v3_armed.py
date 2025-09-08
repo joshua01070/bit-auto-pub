@@ -4,11 +4,12 @@
 multi_coin_auto_trade_live_final_v3_armed.py
 
 LIVE trading bot for "MTF Gating + 1m Armed Entry".
-- Resolve fills: no fire-and-forget. Poll get_order(uuid) and update state from actual fills.
-- Data pipeline: fetch 1m only; resample (right/closed) to N-min for gating (backtest alignment).
+- Resolve fills: poll get_order(uuid) and update state from actual fills (no fire-and-forget).
+- Data pipeline: fetch 1m once per minute; resample (right/closed) to N-min for gating (backtest-aligned).
 - Trigger evaluation: once per minute on minute tick — no per-second 1m OHLCV calls.
 - Non-loosening stop: helper ensures stop never decreases.
 - One-shot startup reconcile: sync local state from exchange balances (source of truth).
+- Continuous heartbeat logs every HEARTBEAT_SEC with position + trailing/TP1 + ARMED status.
 """
 
 import os, time, json, math, logging, traceback
@@ -28,8 +29,8 @@ if os.getenv("UPBIT_LIVE") != "1":
 # =========================
 # 1) CONFIG (aligned to backtest keys)
 # =========================
-ACCESS = ""
-SECRET = ""
+ACCESS = os.getenv("UPBIT_ACCESS", "")
+SECRET = os.getenv("UPBIT_SECRET", "")
 
 TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-SOL"]
 STATE_SCHEMA_VER = 3  # +armed_open_ts
@@ -71,7 +72,7 @@ DEFAULTS: Dict[str, Any] = dict(
     dust_margin=0.98,
 )
 
-# Default per symbol (override via LIVE_PARAMS_PATH if needed)
+# Per-symbol defaults; can be overridden via LIVE_PARAMS_PATH (JSON)
 SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
     "KRW-BTC": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 60, "don_n": 64,
                 "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
@@ -88,10 +89,11 @@ SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
 POLL_SEC = 1.0
 STATE_DIR = "state_live_v3"
 HALT_FILE = "halt.flag"
+HEARTBEAT_SEC = 60            # << continuous heartbeat cadence
 HEARTBEAT_PATH = "heartbeat.txt"
 
 # =========================
-# 2) UTILITIES (PATCHED)
+# 2) UTILITIES
 # =========================
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 ensure_dir(STATE_DIR)
@@ -137,34 +139,29 @@ def safe_call(fn, *args, tries: int = 3, delay: float = 0.5, backoff: float = 1.
                 logging.error(f"[safe_call] {fn.__name__} failed: {e}")
                 raise
             logging.warning(f"[safe_call] {fn.__name__} error: {e}. retry in {t:.1f}s")
-            time.sleep(t)
-            t *= backoff
+            time.sleep(t); t *= backoff
 
 def strip_partial_1m(df: pd.DataFrame) -> pd.DataFrame:
     """
     Remove the *current-minute* row to guarantee closed 1m bars.
-    Upbit OHLCV index is usually tz-naive (KST). We compare using KST-naive time.
+    Upbit OHLCV index is usually tz-naive (KST). Compare using KST-naive time.
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
-    idx: pd.DatetimeIndex = df.index  # assume DatetimeIndex
-    # last index as tz-naive in Asia/Seoul
+    idx: pd.DatetimeIndex = df.index
+    # normalize last index to KST-naive
     if getattr(idx, "tz", None) is not None:
         last_idx = idx.tz_convert("Asia/Seoul")[-1].tz_localize(None)
     else:
         last_idx = idx[-1]
 
-    # current minute (KST, tz-aware → tz-naive)
     now_min_kst_naive = pd.Timestamp.now(tz="Asia/Seoul").floor("min").tz_localize(None)
-
-    # if last row belongs to the current (still-forming) minute, drop it
     if last_idx >= now_min_kst_naive:
         return df.iloc[:-1].copy() if len(df) > 1 else df.iloc[:0].copy()
     return df
 
 def resample_right_closed_ohlc(df1m: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    """Resample with right/closed semantics to mirror backtest."""
     if df1m is None or df1m.empty: return pd.DataFrame()
     if minutes == 1: return df1m.copy()
     rule = f"{minutes}min"
@@ -181,8 +178,15 @@ def sma(series: pd.Series, n: int) -> Optional[pd.Series]:
     if n <= 0 or series is None or len(series) < n: return None
     return series.rolling(n, min_periods=n).mean()
 
+def heartbeat_file():
+    try:
+        with open(HEARTBEAT_PATH, "w") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        pass
+
 # =========================
-# 3) BROKER / FEED / GUARDS (PATCHED best_bid_ask)
+# 3) BROKER / FEED / GUARDS
 # =========================
 class CircuitBreaker:
     def __init__(self, max_fails=3, cool_sec=120):
@@ -215,14 +219,11 @@ class UpbitBroker:
         units = None
 
         if isinstance(ob, list) and ob:
-            # 정상: [ { "orderbook_units": [ {...}, ... ] } ]
             units = (ob[0] or {}).get("orderbook_units", [])
         elif isinstance(ob, dict):
-            # 간헐적으로 dict가 올 수도 있음: { "orderbook_units": [ ... ] } 혹은 에러포맷
             units = ob.get("orderbook_units", [])
 
         if not units:
-            # raise to let CB handle and cool down
             raise RuntimeError("orderbook empty or malformed")
 
         u0 = units[0]
@@ -230,7 +231,6 @@ class UpbitBroker:
         ask = float(u0.get("ask_price", 0.0))
         if bid <= 0 or ask <= 0:
             raise RuntimeError("invalid bid/ask from orderbook")
-
         return bid, ask
 
     def buy_market_krw(self, ticker: str, krw: float) -> dict:
@@ -361,9 +361,8 @@ class SymbolStrategy:
             self.state.stop = candidate
             self._save_state()
 
-    # ---------- order resolve (no fire-and-forget) ----------
+    # ---------- order resolve ----------
     def _resolve_buy_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> Tuple[float, float]:
-        """Return (qty, avg) actually filled; (0,0) if failed."""
         t0 = time.time()
         last_state = ""
         while time.time() - t0 < timeout_s:
@@ -385,7 +384,6 @@ class SymbolStrategy:
         return 0.0, 0.0
 
     def _resolve_sell_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> float:
-        """Return qty actually sold; 0 if failed."""
         t0 = time.time()
         last_state = ""
         while time.time() - t0 < timeout_s:
@@ -404,13 +402,12 @@ class SymbolStrategy:
 
     # ---------- GATE (on N-min close) ----------
     def on_bar_close_tf(self, dfN: pd.DataFrame, cb: CircuitBreaker):
-        """Called when a *new* N-min closed candle is detected."""
         if dfN is None or len(dfN) < max(int(self.p["don_n"]) + 1, int(self.p["ma_l"]) + 1):
             return
 
         highs = dfN["high"]; closes = dfN["close"]
         n = int(self.p["don_n"])
-        upper = float(highs.iloc[-(n+1):-1].max())  # Donchian upper excluding current
+        upper = float(highs.iloc[-(n+1):-1].max())
         prev_close = float(closes.iloc[-1])
 
         ma_pass = True
@@ -456,7 +453,6 @@ class SymbolStrategy:
         if df1m is None or len(df1m) < max(int(self.p["armed_ma_l_1m"]) + 1, int(self.p["armed_rebreak_lookback"]) + 3):
             return
 
-        # Ensure latest closed 1m bar is AFTER arming time
         last_closed_ts = df1m.index[-1].to_pydatetime().timestamp()
         if last_closed_ts <= (self.state.armed_open_ts or 0.0):
             return
@@ -494,7 +490,7 @@ class SymbolStrategy:
             logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY")
             self._enter_position(cb, f"ARMED-{trig}")
 
-    # ---------- ENTER / EXIT (resolve fills) ----------
+    # ---------- ENTER / EXIT ----------
     def _enter_position(self, cb: CircuitBreaker, reason: str):
         try:
             if self.state.has_pos: return
@@ -597,7 +593,7 @@ class SymbolStrategy:
                             self.state.tp1_done = True
                             self._save_state()
 
-        # Optional TP
+        # Optional TP (close remainder)
         if float(self.p.get("tp_rate", 0.0)) > 0 and self.state.qty > 0:
             tp_px = round_to_tick(self.state.avg * (1.0 + float(self.p["tp_rate"])))
             if high_now >= tp_px:
@@ -612,11 +608,6 @@ class SymbolStrategy:
 # 6) STARTUP RECONCILE (one-shot)
 # =========================
 def reconcile_from_exchange(strats: Dict[str, "SymbolStrategy"], broker: "UpbitBroker"):
-    """
-    One-shot sync at startup:
-    - If exchange shows qty > 0: trust exchange and set local state to that position.
-    - If exchange shows qty == 0 but local says has_pos: clear local state to avoid ghost.
-    """
     try:
         bals = broker.get_balances() or []
         by_ccy = {b.get("currency"): b for b in bals}
@@ -625,26 +616,20 @@ def reconcile_from_exchange(strats: Dict[str, "SymbolStrategy"], broker: "UpbitB
             b = by_ccy.get(ccy)
             exch_qty = float((b or {}).get("balance") or 0.0)
             avg_buy = float((b or {}).get("avg_buy_price") or 0.0)
-
             if exch_qty > 1e-12:
-                # Trust exchange as source of truth
                 st.state.has_pos = True
                 st.state.qty = exch_qty
                 st.state.avg = avg_buy
                 st.state.init_qty = exch_qty
                 st.state.ptp_hits = []
                 st.state.tp1_done = False
-                st.state.is_armed = False  # with an open position, don't arm
-                # conservative stop
+                st.state.is_armed = False
                 if avg_buy > 0:
                     trail = st._trail_step()
                     st._raise_stop(round_to_tick(avg_buy * (1.0 - trail)))
-                else:
-                    logging.warning(f"[{sym}] avg_buy_price=0 (deposit or transfer). Stop not set; managing with PTP/TS later.")
                 st._save_state()
                 logging.info(f"[{sym}] [RECONCILE] synced pos from exchange: qty={exch_qty:.8f}, avg={avg_buy:.0f}")
             else:
-                # No position on exchange: clear any local leftover
                 if st.state.has_pos or st.state.qty > 0:
                     st.state = PositionState()
                     st._save_state()
@@ -654,7 +639,7 @@ def reconcile_from_exchange(strats: Dict[str, "SymbolStrategy"], broker: "UpbitB
         logging.error(traceback.format_exc())
 
 # =========================
-# 7) MAIN LOOP (minute tick; fast intrabar only)
+# 7) MAIN LOOP
 # =========================
 def load_symbol_params() -> Dict[str, Dict[str, Any]]:
     cfg_path = os.getenv("LIVE_PARAMS_PATH", "").strip()
@@ -673,13 +658,6 @@ def load_symbol_params() -> Dict[str, Dict[str, Any]]:
             logging.warning(f"[init] param load failed: {e}")
     return SYMBOL_PARAMS_DEFAULT
 
-def heartbeat():
-    try:
-        with open(HEARTBEAT_PATH, "w") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
-    except Exception:
-        pass
-
 def sleep_to_next_minute(offset_sec: float = 0.8):
     now = time.time()
     nxt = (int(now // 60) + 1) * 60 + offset_sec
@@ -697,16 +675,23 @@ def main():
     # <<< One-shot reconcile from exchange >>>
     reconcile_from_exchange(strats, broker)
 
+    first_cycle = True
+    hb_t0 = time.time()
+
     while True:
         try:
             # === 1) Minute tick ===
-            sleep_to_next_minute(offset_sec=0.8)
+            if not first_cycle:
+                sleep_to_next_minute(offset_sec=0.8)
+            else:
+                first_cycle = False
+
             if halted():
                 logging.warning("[HALT] halt.flag detected. sleep 5s")
                 time.sleep(5)
                 continue
 
-            # Fetch 1m once per symbol, resample to N, handle 5m close, then (once per minute) evaluate armed trigger
+            # Fetch 1m per symbol, resample N, process GATE, then check ARMED trigger
             for s in TICKERS:
                 try:
                     if CB[s].blocked(): continue
@@ -718,12 +703,11 @@ def main():
                     if dfN is not None and not dfN.empty:
                         cur_idx = dfN.index[-1]
                         if strats[s].last_tf_idx is None or cur_idx != strats[s].last_tf_idx:
-                            # New N-min closed candle: process GATE first
                             strats[s].on_bar_close_tf(dfN, CB[s])
                             strats[s].last_tf_idx = cur_idx
                             CB[s].ok()
 
-                    # Armed trigger: evaluate ONCE per minute with the same closed 1m data
+                    # Armed trigger once per minute
                     if strats[s].state.is_armed:
                         strats[s].check_armed_trigger_1m(df1, CB[s])
 
@@ -732,7 +716,7 @@ def main():
                     logging.error(f"[{s}] slow loop error: {e}")
                     logging.error(traceback.format_exc())
 
-            # === 2) Fast loop until next minute: only manage positions (no 1m OHLCV calls) ===
+            # === 2) Fast loop until next minute: manage positions only ===
             deadline = (int(time.time() // 60) + 1) * 60 - 0.2
             while time.time() < deadline:
                 for s in TICKERS:
@@ -746,8 +730,27 @@ def main():
                         CB[s].fail("fast")
                         logging.error(f"[{s}] fast loop error: {e}")
                         logging.error(traceback.format_exc())
-                # heartbeat & wait
-                heartbeat()
+
+                # Continuous heartbeat (every HEARTBEAT_SEC)
+                if time.time() - hb_t0 >= HEARTBEAT_SEC:
+                    lines = []
+                    for s, stg in strats.items():
+                        st = stg.state
+                        if st.has_pos:
+                            lines.append(
+                                f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={st.stop:.0f} tp1={int(st.tp1_done)}"
+                            )
+                        elif st.is_armed:
+                            remain = int(max(0, st.armed_until - time.time()))
+                            lines.append(
+                                f"{s}: ARMED({remain}s) anchor={round_to_tick(st.armed_anchor_price):.0f}"
+                            )
+                        else:
+                            lines.append(f"{s}: idle")
+                    logging.info("[hb] " + " | ".join(lines))
+                    heartbeat_file()
+                    hb_t0 = time.time()
+
                 time.sleep(POLL_SEC)
 
         except KeyboardInterrupt:
