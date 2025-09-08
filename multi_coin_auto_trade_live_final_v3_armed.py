@@ -29,8 +29,8 @@ if os.getenv("UPBIT_LIVE") != "1":
 # =========================
 # 1) CONFIG (aligned to backtest keys)
 # =========================
-ACCESS = os.getenv("UPBIT_ACCESS", "")
-SECRET = os.getenv("UPBIT_SECRET", "")
+ACCESS = ""
+SECRET = ""
 
 TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-SOL"]
 STATE_SCHEMA_VER = 3  # +armed_open_ts
@@ -763,3 +763,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
