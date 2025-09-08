@@ -4,99 +4,93 @@
 multi_coin_auto_trade_live_final_v3_armed.py
 
 LIVE trading bot for "MTF Gating + 1m Armed Entry".
-- Resolve fills: poll get_order(uuid) and update state from actual fills (no fire-and-forget).
-- Data pipeline: fetch 1m once per minute; resample (right/closed) to N-min for gating (backtest-aligned).
-- Trigger evaluation: once per minute on minute tick — no per-second 1m OHLCV calls.
-- Non-loosening stop: helper ensures stop never decreases.
-- One-shot startup reconcile: sync local state from exchange balances (source of truth).
-- Continuous heartbeat logs every HEARTBEAT_SEC with position + trailing/TP1 + ARMED status.
+- Resolve fills (poll get_order); no fire-and-forget.
+- Minute tasks (fetch 1m, resample N, gate, armed-trigger) run concurrently per symbol.
+- Fast loop (intrabar manage) runs every second regardless of minute tasks.
+- Non-loosening stop invariant.
+- Startup reconcile from exchange as single source of truth.
+- Heartbeat guaranteed every HEARTBEAT_SEC.
 """
 
 import os, time, json, math, logging, traceback
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 import pandas as pd
 import pyupbit
 
-# =========================
-# 0) RUN GUARD & LOGGING
-# =========================
+# ============== logging & guard ==============
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 if os.getenv("UPBIT_LIVE") != "1":
     raise SystemExit("Refuse to run LIVE. Set env UPBIT_LIVE=1 to confirm.")
 
-# =========================
-# 1) CONFIG (aligned to backtest keys)
-# =========================
+# ============== config ==============
 ACCESS = ""
 SECRET = ""
 
 TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-SOL"]
-STATE_SCHEMA_VER = 3  # +armed_open_ts
+STATE_SCHEMA_VER = 3
 
 DEFAULTS: Dict[str, Any] = dict(
-    # base / gating
-    tf_base=5,
-    use_ma=1, ma_s=10, ma_l=30,
-    don_n=72,
-    entry_tick_buffer=2,
-
-    # armed
-    armed_enable=1,
-    armed_window_min=5,
-    armed_micro_trigger="MA",        # "MA" | "REBREAK"
-    armed_ma_s_1m=5,
-    armed_ma_l_1m=20,
-    armed_rebreak_lookback=5,
-    armed_inval_pct=0.005,
-    armed_reds=3,
-
-    # trade costs / sizing
-    fee=0.0005,
-    min_krw_order=6000.0,
-    qty_step=1e-8,
-    buy_pct=0.30,
-    max_position_krw=None,
-
-    # exits
-    trail_before=0.08,               # unified trail step
-    trail_after=0.08,
-    ptp_levels="",                   # "0.015:0.6,0.03:0.4"
-    ptp_be=1,
-    tp_rate=0.0,                     # if 0, rely on trail/PTP only
-    fast_seq="HL",                   # HL or LH
-
-    # misc
-    eps_exec=0.0003,                 # for BE bump
-    dust_margin=0.98,
+    tf_base=5, use_ma=1, ma_s=10, ma_l=30, don_n=72, entry_tick_buffer=2,
+    armed_enable=1, armed_window_min=5, armed_micro_trigger="MA",
+    armed_ma_s_1m=5, armed_ma_l_1m=20, armed_rebreak_lookback=5,
+    armed_inval_pct=0.005, armed_reds=3,
+    fee=0.0005, min_krw_order=6000.0, qty_step=1e-8, buy_pct=0.30, max_position_krw=None,
+    trail_before=0.08, trail_after=0.08, ptp_levels="", ptp_be=1, tp_rate=0.0,
+    fast_seq="HL", eps_exec=0.0003, dust_margin=0.98,
 )
 
-# Per-symbol defaults; can be overridden via LIVE_PARAMS_PATH (JSON)
 SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
     "KRW-BTC": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 60, "don_n": 64,
                 "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL", "armed_enable": 0, "entry_tick_buffer": 1},
+                "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
+                "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-ETH": {"tf_base": 5, "use_ma": 1, "ma_s": 10, "ma_l": 60, "don_n": 48,
                 "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL", "armed_enable": 0, "entry_tick_buffer": 1},
+                "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
+                "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-SOL": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 45, "don_n": 96,
                 "buy_pct": 0.25, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "", "tp_rate": 0.03,  "fast_seq": "HL", "armed_enable": 1,
-                "armed_micro_trigger": "MA", "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
+                "ptp_levels": "", "tp_rate": 0.03,  "fast_seq": "HL",
+                "armed_enable": 1, "armed_micro_trigger": "MA",
+                "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
 }
 
 POLL_SEC = 1.0
 STATE_DIR = "state_live_v3"
 HALT_FILE = "halt.flag"
-HEARTBEAT_SEC = 60            # << continuous heartbeat cadence
+HEARTBEAT_SEC = 60
 HEARTBEAT_PATH = "heartbeat.txt"
 
-# =========================
-# 2) UTILITIES
-# =========================
+# minute task pool
+FETCH_WORKERS = 3                      # <= len(TICKERS)
+MINUTE_TASK_DEADLINE = 15.0            # seconds cap for all minute tasks
+PER_TASK_TIMEOUT = 6.0                 # per-symbol minute task timeout
+
+# ============== utils ==============
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 ensure_dir(STATE_DIR)
+
+def patch_pyupbit_timeout():
+    try:
+        import pyupbit.request_api as _ra
+        _orig_pub = _ra._call_public_api
+        def _pub(url, **kw):
+            kw.setdefault("timeout", 4)  # seconds
+            return _orig_pub(url, **kw)
+        _ra._call_public_api = _pub
+        if hasattr(_ra, "_call_private_api"):
+            _orig_pri = _ra._call_private_api
+            def _pri(url, **kw):
+                kw.setdefault("timeout", 4)
+                return _orig_pri(url, **kw)
+            _ra._call_private_api = _pri
+        logging.info("[init] pyupbit timeout=4s patch OK")
+    except Exception as e:
+        logging.warning(f"[init] timeout patch failed: {e}")
+patch_pyupbit_timeout()
 
 def tick_size_for(p: float) -> float:
     if p >= 2_000_000: return 1000.0
@@ -110,8 +104,7 @@ def tick_size_for(p: float) -> float:
     return 0.01
 
 def round_to_tick(p: float) -> float:
-    t = tick_size_for(p)
-    return math.floor(p / t) * t
+    t = tick_size_for(p); return math.floor(p / t) * t
 
 def floor_to_step(x: float, step: float) -> float:
     return math.floor(x / step) * step
@@ -126,8 +119,7 @@ def parse_ptp_levels(spec: str) -> List[Tuple[float, float]]:
     out.sort(key=lambda x: x[0])
     return out
 
-def halted() -> bool:
-    return os.path.exists(HALT_FILE)
+def halted() -> bool: return os.path.exists(HALT_FILE)
 
 def safe_call(fn, *args, tries: int = 3, delay: float = 0.5, backoff: float = 1.7, **kwargs):
     t = delay
@@ -142,22 +134,15 @@ def safe_call(fn, *args, tries: int = 3, delay: float = 0.5, backoff: float = 1.
             time.sleep(t); t *= backoff
 
 def strip_partial_1m(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Remove the *current-minute* row to guarantee closed 1m bars.
-    Upbit OHLCV index is usually tz-naive (KST). Compare using KST-naive time.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
+    if df is None or df.empty: return pd.DataFrame()
     idx: pd.DatetimeIndex = df.index
-    # normalize last index to KST-naive
-    if getattr(idx, "tz", None) is not None:
-        last_idx = idx.tz_convert("Asia/Seoul")[-1].tz_localize(None)
+    # 기준: KST 분 정각 미완성 캔들 제거
+    if idx.tz is None:
+        last_idx_kst_naive = idx[-1].to_pydatetime()
     else:
-        last_idx = idx[-1]
-
-    now_min_kst_naive = pd.Timestamp.now(tz="Asia/Seoul").floor("min").tz_localize(None)
-    if last_idx >= now_min_kst_naive:
+        last_idx_kst_naive = idx.tz_convert("Asia/Seoul")[-1].to_pydatetime().replace(tzinfo=None)
+    now_min_kst_naive = pd.Timestamp.now(tz="Asia/Seoul").floor("min").to_pydatetime().replace(tzinfo=None)
+    if last_idx_kst_naive >= now_min_kst_naive:
         return df.iloc[:-1].copy() if len(df) > 1 else df.iloc[:0].copy()
     return df
 
@@ -165,13 +150,13 @@ def resample_right_closed_ohlc(df1m: pd.DataFrame, minutes: int) -> pd.DataFrame
     if df1m is None or df1m.empty: return pd.DataFrame()
     if minutes == 1: return df1m.copy()
     rule = f"{minutes}min"
-    o = df1m["open"].resample(rule, label="right", closed="right").first()
-    h = df1m["high"].resample(rule, label="right", closed="right").max()
-    l = df1m["low"].resample(rule, label="right", closed="right").min()
-    c = df1m["close"].resample(rule, label="right", closed="right").last()
-    vsrc = df1m["volume"] if "volume" in df1m.columns else pd.Series(index=df1m.index, dtype=float)
-    v = vsrc.resample(rule, label="right", closed="right").sum()
-    out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v}).dropna(subset=["open","high","low","close"])
+    out = pd.DataFrame({
+        "open":  df1m["open"].resample(rule, label="right", closed="right").first(),
+        "high":  df1m["high"].resample(rule, label="right", closed="right").max(),
+        "low":   df1m["low"].resample(rule, label="right", closed="right").min(),
+        "close": df1m["close"].resample(rule, label="right", closed="right").last(),
+        "volume": (df1m["volume"] if "volume" in df1m.columns else pd.Series(index=df1m.index, dtype=float)).resample(rule, label="right", closed="right").sum(),
+    }).dropna(subset=["open","high","low","close"])
     return out
 
 def sma(series: pd.Series, n: int) -> Optional[pd.Series]:
@@ -185,22 +170,17 @@ def heartbeat_file():
     except Exception:
         pass
 
-# =========================
-# 3) BROKER / FEED / GUARDS
-# =========================
+# ============== broker/feed/circuit ==============
 class CircuitBreaker:
     def __init__(self, max_fails=3, cool_sec=120):
-        self.max_fails = max_fails
-        self.cool_sec = cool_sec
+        self.max_fails, self.cool_sec = max_fails, cool_sec
         self.fail_count = 0
         self.block_until = 0.0
-    def blocked(self) -> bool:
-        return time.time() < self.block_until
-    def ok(self):
-        self.fail_count = 0
-    def fail(self, why: str = ""):
+    def blocked(self) -> bool: return time.time() < self.block_until
+    def ok(self): self.fail_count = 0
+    def fail(self, tag=""):
         self.fail_count += 1
-        logging.warning(f"[CB] failure {self.fail_count}/{self.max_fails} {why}")
+        logging.warning(f"[CB] failure {self.fail_count}/{self.max_fails} {tag}")
         if self.fail_count >= self.max_fails:
             self.block_until = time.time() + self.cool_sec
             self.fail_count = 0
@@ -209,64 +189,32 @@ class CircuitBreaker:
 class UpbitBroker:
     def __init__(self, access: str, secret: str):
         self.up = pyupbit.Upbit(access, secret)
-
     def krw_balance(self) -> float:
-        bal = safe_call(self.up.get_balance, "KRW")
-        return float(bal or 0.0)
-
+        bal = safe_call(self.up.get_balance, "KRW"); return float(bal or 0.0)
     def best_bid_ask(self, ticker: str) -> Tuple[float, float]:
         ob = safe_call(pyupbit.get_orderbook, ticker)
-        units = None
-
-        if isinstance(ob, list) and ob:
-            units = (ob[0] or {}).get("orderbook_units", [])
-        elif isinstance(ob, dict):
-            units = ob.get("orderbook_units", [])
-
-        if not units:
-            raise RuntimeError("orderbook empty or malformed")
-
-        u0 = units[0]
-        bid = float(u0.get("bid_price", 0.0))
-        ask = float(u0.get("ask_price", 0.0))
-        if bid <= 0 or ask <= 0:
-            raise RuntimeError("invalid bid/ask from orderbook")
+        units = (ob[0] or {}).get("orderbook_units", []) if isinstance(ob, list) and ob else (ob or {}).get("orderbook_units", [])
+        if not units: raise RuntimeError("orderbook empty")
+        u0 = units[0]; bid = float(u0.get("bid_price", 0.0)); ask = float(u0.get("ask_price", 0.0))
+        if bid <= 0 or ask <= 0: raise RuntimeError("invalid bid/ask")
         return bid, ask
-
     def buy_market_krw(self, ticker: str, krw: float) -> dict:
         return safe_call(self.up.buy_market_order, ticker, krw)
-
     def sell_market(self, ticker: str, qty: float) -> dict:
         return safe_call(self.up.sell_market_order, ticker, qty)
-
     def get_order(self, uuid: str) -> dict:
         return safe_call(self.up.get_order, uuid)
-
-    def cancel_order(self, uuid: str) -> dict:
-        return safe_call(self.up.cancel_order, uuid)
-
     def get_balances(self):
         return safe_call(self.up.get_balances)
 
-    def get_position_qty(self, ticker: str) -> float:
-        cc = ticker.split("-")[1]
-        bals = self.get_balances() or []
-        for b in bals:
-            if b.get("currency") == cc:
-                return float(b.get("balance") or 0.0)
-        return 0.0
-
 class Feed:
-    def __init__(self, ticker: str):
-        self.ticker = ticker
+    def __init__(self, ticker: str): self.ticker = ticker
     def fetch_1m_df(self, count: int = 200) -> pd.DataFrame:
         df = safe_call(pyupbit.get_ohlcv, self.ticker, interval="minute1", count=count)
         if df is None: return pd.DataFrame()
         return strip_partial_1m(df)
 
-# =========================
-# 4) STATE
-# =========================
+# ============== state/strategy ==============
 @dataclass
 class PositionState:
     has_pos: bool = False
@@ -277,490 +225,354 @@ class PositionState:
     ptp_hits: List[float] = None
     tp1_done: bool = False
     init_qty: float = 0.0
-
     # Armed
     is_armed: bool = False
     armed_until: float = 0.0
     armed_anchor_price: float = 0.0
     red_run_1m: int = 0
-    armed_open_ts: float = 0.0  # last armed open time (epoch seconds)
-
+    armed_open_ts: float = 0.0
     def to_json(self) -> dict:
-        d = asdict(self)
-        d["ptp_hits"] = self.ptp_hits or []
-        d["_ver"] = STATE_SCHEMA_VER
-        return d
-
+        d = asdict(self); d["ptp_hits"] = self.ptp_hits or []; d["_ver"] = STATE_SCHEMA_VER; return d
     @staticmethod
     def from_json(d: dict) -> "PositionState":
         st = PositionState()
         st.has_pos = bool(d.get("has_pos", False))
-        st.qty = float(d.get("qty", 0.0))
-        st.avg = float(d.get("avg", 0.0))
-        st.stop = float(d.get("stop", 0.0))
-        st.ts_anchor = float(d.get("ts_anchor", 0.0))
-        st.ptp_hits = list(d.get("ptp_hits", []))
-        st.tp1_done = bool(d.get("tp1_done", False))
+        st.qty = float(d.get("qty", 0.0)); st.avg = float(d.get("avg", 0.0))
+        st.stop = float(d.get("stop", 0.0)); st.ts_anchor = float(d.get("ts_anchor", 0.0))
+        st.ptp_hits = list(d.get("ptp_hits", [])); st.tp1_done = bool(d.get("tp1_done", False))
         st.init_qty = float(d.get("init_qty", 0.0))
-        # armed
-        st.is_armed = bool(d.get("is_armed", False))
-        st.armed_until = float(d.get("armed_until", 0.0))
+        st.is_armed = bool(d.get("is_armed", False)); st.armed_until = float(d.get("armed_until", 0.0))
         st.armed_anchor_price = float(d.get("armed_anchor_price", 0.0))
-        st.red_run_1m = int(d.get("red_run_1m", 0))
-        st.armed_open_ts = float(d.get("armed_open_ts", 0.0))
+        st.red_run_1m = int(d.get("red_run_1m", 0)); st.armed_open_ts = float(d.get("armed_open_ts", 0.0))
         return st
 
-# =========================
-# 5) STRATEGY
-# =========================
 class SymbolStrategy:
     def __init__(self, symbol: str, broker: UpbitBroker, params: Dict[str, Any]):
-        self.symbol = symbol
-        self.broker = broker
+        self.symbol = symbol; self.broker = broker
         self.p = {**DEFAULTS, **(params or {})}
         self.state_path = os.path.join(STATE_DIR, f"{self.symbol.replace('-','_')}.json")
         self.state = self._load_state()
         self.ptp_levels = parse_ptp_levels(self.p.get("ptp_levels", ""))
-        self.last_tf_idx: Optional[pd.Timestamp] = None  # last closed N-min idx
+        self.last_tf_idx: Optional[pd.Timestamp] = None
 
-    # ---------- state io ----------
     def _load_state(self) -> PositionState:
         try:
             if os.path.exists(self.state_path):
-                with open(self.state_path, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                st = PositionState.from_json(d)
-                logging.info(f"[{self.symbol}] state loaded")
-                return st
+                with open(self.state_path,"r",encoding="utf-8") as f: d=json.load(f)
+                st = PositionState.from_json(d); logging.info(f"[{self.symbol}] state loaded"); return st
         except Exception as e:
             logging.warning(f"[{self.symbol}] state load error: {e}")
         return PositionState()
 
     def _save_state(self):
         try:
-            with open(self.state_path, "w", encoding="utf-8") as f:
+            with open(self.state_path,"w",encoding="utf-8") as f:
                 json.dump(self.state.to_json(), f, ensure_ascii=False, indent=2)
         except Exception as e:
             logging.warning(f"[{self.symbol}] state save error: {e}")
 
-    # ---------- helpers ----------
-    def _trail_step(self) -> float:
-        return float(self.p.get("trail_before", 0.08))
-
-    def _has_budget(self, krw: float) -> bool:
-        if krw < float(self.p["min_krw_order"]): return False
-        m = self.p.get("max_position_krw")
-        if m and krw > float(m): return False
-        return True
-
+    def _trail_step(self) -> float: return float(self.p.get("trail_before", 0.08))
     def _raise_stop(self, candidate: float):
-        """Non-loosening stop: never decreases stop (with immediate persist)."""
-        if candidate is None or candidate <= 0: return
-        cur = self.state.stop or 0.0
-        if candidate > cur:
-            self.state.stop = candidate
-            self._save_state()
+        if candidate and candidate > (self.state.stop or 0.0):
+            self.state.stop = candidate; self._save_state()
 
-    # ---------- order resolve ----------
-    def _resolve_buy_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> Tuple[float, float]:
-        t0 = time.time()
-        last_state = ""
-        while time.time() - t0 < timeout_s:
-            od = self.broker.get_order(uuid)
-            last_state = str(od.get("state"))
-            trades = od.get("trades") or []
-            if last_state == "done" or trades:
-                total_qty, total_funds = 0.0, 0.0
-                for tr in trades:
-                    px = float(tr.get("price", 0.0))
-                    vol = float(tr.get("volume", 0.0))
-                    funds = float(tr.get("funds", px * vol))
-                    total_qty += vol
-                    total_funds += funds
-                avg = (total_funds / total_qty) if total_qty > 0 else 0.0
-                return total_qty, avg
+    # ----- fill resolution -----
+    def _resolve_buy_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> Tuple[float,float]:
+        t0 = time.time(); last_state=""
+        while time.time()-t0 < timeout_s:
+            od = self.broker.get_order(uuid); last_state=str(od.get("state"))
+            trs = od.get("trades") or []
+            if last_state=="done" or trs:
+                qty,funds=0.0,0.0
+                for tr in trs:
+                    px=float(tr.get("price",0.0)); vol=float(tr.get("volume",0.0))
+                    funds += (float(tr.get("funds",0.0)) or (px*vol)); qty += vol
+                avg = funds/qty if qty>0 else 0.0
+                return qty, avg
             time.sleep(poll_s)
-        logging.error(f"[{self.symbol}] buy resolve timeout, last_state={last_state}")
-        return 0.0, 0.0
+        logging.error(f"[{self.symbol}] buy resolve timeout (state={last_state})")
+        return 0.0,0.0
 
     def _resolve_sell_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> float:
-        t0 = time.time()
-        last_state = ""
-        while time.time() - t0 < timeout_s:
-            od = self.broker.get_order(uuid)
-            last_state = str(od.get("state"))
-            trades = od.get("trades") or []
-            if last_state == "done" or trades:
-                total_qty = 0.0
-                for tr in trades:
-                    vol = float(tr.get("volume", 0.0))
-                    total_qty += vol
-                return total_qty
+        t0 = time.time(); last_state=""
+        while time.time()-t0 < timeout_s:
+            od = self.broker.get_order(uuid); last_state=str(od.get("state"))
+            trs = od.get("trades") or []
+            if last_state=="done" or trs:
+                qty=0.0
+                for tr in trs: qty += float(tr.get("volume",0.0))
+                return qty
             time.sleep(poll_s)
-        logging.error(f"[{self.symbol}] sell resolve timeout, last_state={last_state}")
+        logging.error(f"[{self.symbol}] sell resolve timeout (state={last_state})")
         return 0.0
 
-    # ---------- GATE (on N-min close) ----------
-    def on_bar_close_tf(self, dfN: pd.DataFrame, cb: CircuitBreaker):
-        if dfN is None or len(dfN) < max(int(self.p["don_n"]) + 1, int(self.p["ma_l"]) + 1):
-            return
-
-        highs = dfN["high"]; closes = dfN["close"]
-        n = int(self.p["don_n"])
-        upper = float(highs.iloc[-(n+1):-1].max())
-        prev_close = float(closes.iloc[-1])
-
-        ma_pass = True
-        if int(self.p["use_ma"]) == 1:
-            ms = sma(closes, int(self.p["ma_s"]))
-            ml = sma(closes, int(self.p["ma_l"]))
-            if ms is None or ml is None or pd.isna(ms.iloc[-1]) or pd.isna(ml.iloc[-1]) or ms.iloc[-1] <= ml.iloc[-1]:
-                ma_pass = False
-
-        tick = tick_size_for(upper)
-        up_buf = upper + tick * int(self.p.get("entry_tick_buffer", 2))
-        break_pass = prev_close > up_buf
-
-        if int(self.p.get("armed_enable", 0)) == 0:
-            # legacy: immediate entry
-            if not self.state.has_pos and break_pass and ma_pass and not cb.blocked():
-                logging.info(f"[{self.symbol}] [LEGACY-ENTER] {int(self.p['tf_base'])}m pass → BUY")
-                self._enter_position(cb, "LEGACY")
-            return
-
-        # Armed mode: open window
-        if break_pass and ma_pass and not self.state.has_pos and not self.state.is_armed:
-            window = int(self.p.get("armed_window_min", self.p["tf_base"]))
-            now_ts = time.time()
-            self.state.is_armed = True
-            self.state.armed_until = now_ts + window * 60
-            self.state.armed_anchor_price = upper
-            self.state.red_run_1m = 0
-            self.state.armed_open_ts = now_ts   # triggers must use 1m bars *after* this
-            self._save_state()
-            logging.info(f"[{self.symbol}] [ARMED] Gate opened {window}m. Anchor={round_to_tick(upper):.0f}")
-
-    # ---------- TRIGGER (1m, evaluated once per minute) ----------
-    def check_armed_trigger_1m(self, df1m: pd.DataFrame, cb: CircuitBreaker):
-        if not self.state.is_armed:
-            return
-        if time.time() >= self.state.armed_until:
-            self.state.is_armed = False
-            self._save_state()
-            logging.info(f"[{self.symbol}] [DISARMED] Window expired")
-            return
-
-        if df1m is None or len(df1m) < max(int(self.p["armed_ma_l_1m"]) + 1, int(self.p["armed_rebreak_lookback"]) + 3):
-            return
-
-        last_closed_ts = df1m.index[-1].to_pydatetime().timestamp()
-        if last_closed_ts <= (self.state.armed_open_ts or 0.0):
-            return
-
-        prev1m = df1m.iloc[-2]; cur1m = df1m.iloc[-1]
-        # invalidations
-        self.state.red_run_1m = self.state.red_run_1m + 1 if cur1m["close"] < prev1m["close"] else 0
-        if int(self.p.get("armed_reds", 3)) > 0 and self.state.red_run_1m >= int(self.p["armed_reds"]):
-            self.state.is_armed = False
-            self._save_state()
-            logging.info(f"[{self.symbol}] [DISARMED] {self.p['armed_reds']} red candles")
-            return
-        if float(cur1m["low"]) < float(self.state.armed_anchor_price) * (1.0 - float(self.p["armed_inval_pct"])):
-            self.state.is_armed = False
-            self._save_state()
-            logging.info(f"[{self.symbol}] [DISARMED] Low < anchor")
-            return
-
-        # trigger
-        trigger_ok = False
-        trig = str(self.p.get("armed_micro_trigger", "MA")).upper()
-        if trig == "MA":
-            s1 = sma(df1m["close"], int(self.p["armed_ma_s_1m"]))
-            l1 = sma(df1m["close"], int(self.p["armed_ma_l_1m"]))
-            if s1 is not None and l1 is not None and len(s1) >= 2 and len(l1) >= 2:
-                if s1.iloc[-2] <= l1.iloc[-2] and s1.iloc[-1] > l1.iloc[-1]:
-                    trigger_ok = True
-        elif trig == "REBREAK":
-            k = int(self.p["armed_rebreak_lookback"])
-            recent_high = float(df1m["high"].iloc[-k-1:-1].max())
-            if float(cur1m["close"]) > recent_high:
-                trigger_ok = True
-
-        if trigger_ok and not cb.blocked() and not self.state.has_pos:
-            logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY")
-            self._enter_position(cb, f"ARMED-{trig}")
-
-    # ---------- ENTER / EXIT ----------
+    # ----- ENTER / EXIT -----
     def _enter_position(self, cb: CircuitBreaker, reason: str):
         try:
             if self.state.has_pos: return
             total_krw = self.broker.krw_balance()
             amt = total_krw * float(self.p["buy_pct"])
-            if not self._has_budget(amt):
-                logging.info(f"[{self.symbol}] [SKIP] budget too small ({amt:.0f} KRW)")
-                return
-
+            if amt < float(self.p["min_krw_order"]):
+                logging.info(f"[{self.symbol}] [SKIP] low budget {amt:.0f}"); return
             resp = self.broker.buy_market_krw(self.symbol, amt)
-            uuid = str(resp.get("uuid", ""))
-            if not uuid:
-                cb.fail("buy-uuid")
-                logging.error(f"[{self.symbol}] BUY no uuid")
-                if self.state.is_armed:
-                    self.state.is_armed = False; self._save_state()
-                return
-
+            uuid = str(resp.get("uuid",""))
+            if not uuid: cb.fail("buy-uuid"); logging.error(f"[{self.symbol}] BUY no uuid"); return
             qty, avg = self._resolve_buy_fill(uuid)
-            if qty <= 0 or avg <= 0:
-                cb.fail("buy-nofill")
-                logging.error(f"[{self.symbol}] BUY no fill")
-                if self.state.is_armed:
-                    self.state.is_armed = False; self._save_state()
-                return
-
-            # state update from actual fill
-            self.state.has_pos = True
-            self.state.qty = qty
-            self.state.avg = avg
-            self.state.stop = round_to_tick(avg * (1.0 - self._trail_step()))
-            self.state.ts_anchor = avg
-            self.state.ptp_hits = []
-            self.state.tp1_done = False
-            self.state.init_qty = qty
-            if self.state.is_armed:
-                self.state.is_armed = False
-            self._save_state()
-            cb.ok()
+            if qty<=0 or avg<=0: cb.fail("buy-nofill"); logging.error(f"[{self.symbol}] BUY no fill"); return
+            self.state.has_pos=True; self.state.qty=qty; self.state.avg=avg
+            self.state.init_qty=qty; self.state.ptp_hits=[]; self.state.tp1_done=False
+            self.state.ts_anchor=avg; self._raise_stop(round_to_tick(avg*(1.0-self._trail_step())))
+            self.state.is_armed=False; self._save_state(); cb.ok()
             logging.info(f"[{self.symbol}] [BUY-{reason}] {qty:.8f} @ {round_to_tick(avg):.0f}")
         except Exception as e:
-            cb.fail("buy-exc")
-            logging.error(f"[{self.symbol}] BUY error: {e}")
-            logging.error(traceback.format_exc())
-            if self.state.is_armed:
-                self.state.is_armed = False; self._save_state()
+            cb.fail("buy-exc"); logging.error(f"[{self.symbol}] BUY error: {e}"); logging.error(traceback.format_exc())
 
     def _sell(self, qty: float, reason: str):
         try:
             qty = min(qty, self.state.qty)
-            if qty <= 0: return
+            if qty<=0: return
             resp = self.broker.sell_market(self.symbol, qty)
-            uuid = str(resp.get("uuid", ""))
-            if not uuid:
-                logging.error(f"[{self.symbol}] SELL no uuid")
-                return
+            uuid = str(resp.get("uuid",""))
+            if not uuid: logging.error(f"[{self.symbol}] SELL no uuid"); return
             filled = self._resolve_sell_fill(uuid)
-            if filled <= 0:
-                logging.error(f"[{self.symbol}] SELL no fill")
-                return
+            if filled<=0: logging.error(f"[{self.symbol}] SELL no fill"); return
             self.state.qty -= filled
             if self.state.qty <= 1e-12:
-                self.state.has_pos = False
-                self.state.qty = 0.0
-                self.state.avg = 0.0
-                self.state.stop = 0.0
-                self.state.ts_anchor = 0.0
-                self.state.ptp_hits = []
-                self.state.tp1_done = False
-                self.state.init_qty = 0.0
+                self.state = PositionState()  # flat reset
             self._save_state()
             logging.info(f"[{self.symbol}] [SELL-{reason}] qty={filled:.8f}")
         except Exception as e:
-            logging.error(f"[{self.symbol}] SELL error: {e}")
-            logging.error(traceback.format_exc())
+            logging.error(f"[{self.symbol}] SELL error: {e}"); logging.error(traceback.format_exc())
 
-    # ---------- INTRABAR MGMT ----------
-    def manage_intrabar(self, last_bid: float, last_ask: float):
+    # ----- GATE (N-min close) -----
+    def on_bar_close_tf(self, dfN: pd.DataFrame, cb: CircuitBreaker):
+        highs, closes = dfN["high"], dfN["close"]
+        n=int(self.p["don_n"])
+        if len(highs)<n+1: return
+        upper = float(highs.iloc[-(n+1):-1].max())
+        prev_close = float(closes.iloc[-1])
+        ma_pass=True
+        if int(self.p["use_ma"])==1:
+            ms=sma(closes,int(self.p["ma_s"])); ml=sma(closes,int(self.p["ma_l"]))
+            if ms is None or ml is None or pd.isna(ms.iloc[-1]) or pd.isna(ml.iloc[-1]) or ms.iloc[-1] <= ml.iloc[-1]:
+                ma_pass=False
+        up_buf = upper + tick_size_for(upper)*int(self.p.get("entry_tick_buffer",2))
+        break_pass = prev_close > up_buf
+
+        if int(self.p.get("armed_enable",0))==0:
+            if not self.state.has_pos and break_pass and ma_pass and not cb.blocked():
+                logging.info(f"[{self.symbol}] [LEGACY-ENTER] pass → BUY")
+                self._enter_position(cb,"LEGACY")
+            return
+
+        # ==== FIX #1: anchor = max(upper, prev_close) ====
+        if break_pass and ma_pass and not self.state.has_pos and not self.state.is_armed:
+            window = int(self.p.get("armed_window_min", self.p["tf_base"]))
+            now_ts = time.time()
+            anchor = max(upper, prev_close)
+            self.state.is_armed=True
+            self.state.armed_until=now_ts+window*60
+            self.state.armed_anchor_price=anchor
+            self.state.red_run_1m=0
+            self.state.armed_open_ts=now_ts
+            self._save_state()
+            logging.info(f"[{self.symbol}] [ARMED] {window}m anchor={round_to_tick(anchor):.0f}")
+
+    # ----- TRIGGER (1m, once per minute) -----
+    def check_armed_trigger_1m(self, df1m: pd.DataFrame, cb: CircuitBreaker):
+        if not self.state.is_armed: return
+        if time.time() >= self.state.armed_until:
+            self.state.is_armed=False; self._save_state()
+            logging.info(f"[{self.symbol}] [DISARMED] window expired"); return
+        if df1m is None or len(df1m)<max(int(self.p["armed_ma_l_1m"])+1,int(self.p["armed_rebreak_lookback"])+3): return
+        last_closed_ts = df1m.index[-1].to_pydatetime().timestamp()
+        if last_closed_ts <= (self.state.armed_open_ts or 0.0): return
+        prev1m, cur1m = df1m.iloc[-2], df1m.iloc[-1]
+        self.state.red_run_1m = self.state.red_run_1m + 1 if cur1m["close"]<prev1m["close"] else 0
+        if int(self.p.get("armed_reds",3))>0 and self.state.red_run_1m>=int(self.p["armed_reds"]):
+            self.state.is_armed=False; self._save_state()
+            logging.info(f"[{self.symbol}] [DISARMED] reds={self.p['armed_reds']}"); return
+        # ==== FIX #2: <= (경계 포함) ====
+        if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):
+            self.state.is_armed=False; self._save_state()
+            logging.info(f"[{self.symbol}] [DISARMED] low<=anchor"); return
+        trig=str(self.p.get("armed_micro_trigger","MA")).upper(); trigger_ok=False
+        if trig=="MA":
+            s1=sma(df1m["close"],int(self.p["armed_ma_s_1m"])); l1=sma(df1m["close"],int(self.p["armed_ma_l_1m"]))
+            if s1 is not None and l1 is not None and len(s1)>=2 and len(l1)>=2:
+                if s1.iloc[-2] <= l1.iloc[-2] and s1.iloc[-1] > l1.iloc[-1]: trigger_ok=True
+        elif trig=="REBREAK":
+            k=int(self.p["armed_rebreak_lookback"]); recent_high=float(df1m["high"].iloc[-k-1:-1].max())
+            if float(cur1m["close"])>recent_high: trigger_ok=True
+        if trigger_ok and not cb.blocked() and not self.state.has_pos:
+            logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY")
+            self._enter_position(cb,f"ARMED-{trig}")
+
+    # ----- intrabar manage (1s) -----
+    def manage_intrabar(self, bid: float, ask: float):
         if not self.state.has_pos: return
-        trail = self._trail_step()
-        high_now = max(last_bid, last_ask)
-
-        # Non-loosening trailing raise
-        ts_bar = round_to_tick(high_now * (1.0 - trail))
-        self._raise_stop(ts_bar)
-
+        trail=self._trail_step(); high_now=max(bid,ask)
+        self._raise_stop(round_to_tick(high_now*(1.0-trail)))
         # PTP + BE bump
         if self.ptp_levels:
             for (lv, fr) in self.ptp_levels:
                 if lv in (self.state.ptp_hits or []): continue
-                tgt = round_to_tick(self.state.avg * (1.0 + lv))
-                if high_now >= tgt and self.state.qty > 0:
-                    sell_qty = min(self.state.init_qty * float(fr), self.state.qty)
-                    if sell_qty > 0:
+                tgt=round_to_tick(self.state.avg*(1.0+lv))
+                if high_now>=tgt and self.state.qty>0:
+                    sell_qty=min(self.state.init_qty*float(fr), self.state.qty)
+                    if sell_qty>0:
                         self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
                         (self.state.ptp_hits or []).append(lv)
-                        if int(self.p.get("ptp_be", 0)) == 1:
-                            be = self.state.avg * (1.0 + float(self.p["fee"]) + float(self.p["eps_exec"]))
+                        if int(self.p.get("ptp_be",0))==1:
+                            be=self.state.avg*(1.0+float(self.p["fee"])+float(self.p["eps_exec"]))
                             self._raise_stop(round_to_tick(be))
-                            self.state.tp1_done = True
-                            self._save_state()
+                            self.state.tp1_done=True; self._save_state()
+        # TP
+        tp=float(self.p.get("tp_rate",0.0))
+        if tp>0 and self.state.qty>0:
+            tp_px=round_to_tick(self.state.avg*(1.0+tp))
+            if high_now>=tp_px: self._sell(self.state.qty,"TP"); return
+        # TS
+        if self.state.stop and bid<=self.state.stop and self.state.qty>0:
+            self._sell(self.state.qty,"TS")
 
-        # Optional TP (close remainder)
-        if float(self.p.get("tp_rate", 0.0)) > 0 and self.state.qty > 0:
-            tp_px = round_to_tick(self.state.avg * (1.0 + float(self.p["tp_rate"])))
-            if high_now >= tp_px:
-                self._sell(self.state.qty, "TP")
-                return
-
-        # Trailing stop exit
-        if self.state.stop and last_bid <= self.state.stop and self.state.qty > 0:
-            self._sell(self.state.qty, "TS")
-
-# =========================
-# 6) STARTUP RECONCILE (one-shot)
-# =========================
-def reconcile_from_exchange(strats: Dict[str, "SymbolStrategy"], broker: "UpbitBroker"):
+# ============== reconcile ==============
+def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBroker):
     try:
-        bals = broker.get_balances() or []
-        by_ccy = {b.get("currency"): b for b in bals}
-        for sym, st in strats.items():
-            ccy = sym.split("-")[1]
-            b = by_ccy.get(ccy)
-            exch_qty = float((b or {}).get("balance") or 0.0)
-            avg_buy = float((b or {}).get("avg_buy_price") or 0.0)
-            if exch_qty > 1e-12:
-                st.state.has_pos = True
-                st.state.qty = exch_qty
-                st.state.avg = avg_buy
-                st.state.init_qty = exch_qty
-                st.state.ptp_hits = []
-                st.state.tp1_done = False
-                st.state.is_armed = False
-                if avg_buy > 0:
-                    trail = st._trail_step()
-                    st._raise_stop(round_to_tick(avg_buy * (1.0 - trail)))
-                st._save_state()
-                logging.info(f"[{sym}] [RECONCILE] synced pos from exchange: qty={exch_qty:.8f}, avg={avg_buy:.0f}")
+        bals=broker.get_balances() or []; by_ccy={b.get("currency"):b for b in bals}
+        for sym, stg in strats.items():
+            ccy=sym.split("-")[1]; b=by_ccy.get(ccy)
+            qty=float((b or {}).get("balance") or 0.0); avg=float((b or {}).get("avg_buy_price") or 0.0)
+            if qty>1e-12:
+                stg.state.has_pos=True; stg.state.qty=qty; stg.state.avg=avg
+                stg.state.init_qty=qty; stg.state.ptp_hits=[]; stg.state.tp1_done=False
+                stg.state.is_armed=False
+                stg._raise_stop(round_to_tick(avg*(1.0-stg._trail_step())))
+                stg._save_state()
+                logging.info(f"[{sym}] [RECONCILE] qty={qty:.8f}, avg={avg:.0f}")
             else:
-                if st.state.has_pos or st.state.qty > 0:
-                    st.state = PositionState()
-                    st._save_state()
-                    logging.info(f"[{sym}] [RECONCILE] no exchange pos; cleared local state.")
+                if stg.state.has_pos or stg.state.qty>0:
+                    stg.state=PositionState(); stg._save_state()
+                    logging.info(f"[{sym}] [RECONCILE] cleared local state")
     except Exception as e:
-        logging.error(f"[reconcile] error: {e}")
-        logging.error(traceback.format_exc())
+        logging.error(f"[reconcile] {e}"); logging.error(traceback.format_exc())
 
-# =========================
-# 7) MAIN LOOP
-# =========================
+# ============== params loader ==============
 def load_symbol_params() -> Dict[str, Dict[str, Any]]:
-    cfg_path = os.getenv("LIVE_PARAMS_PATH", "").strip()
+    cfg_path=os.getenv("LIVE_PARAMS_PATH","").strip()
     if cfg_path and os.path.exists(cfg_path):
         try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            out: Dict[str, Dict[str, Any]] = {}
+            with open(cfg_path,"r",encoding="utf-8") as f: raw=json.load(f)
+            out={}
             for tk in TICKERS:
-                key1 = tk; key2 = tk.split("-")[1]
-                src = raw.get(key1) or raw.get(key2)
-                out[tk] = src or {}
+                out[tk]= raw.get(tk) or raw.get(tk.split("-")[1]) or {}
             logging.info(f"[init] loaded params from {cfg_path}")
             return out
         except Exception as e:
             logging.warning(f"[init] param load failed: {e}")
     return SYMBOL_PARAMS_DEFAULT
 
-def sleep_to_next_minute(offset_sec: float = 0.8):
-    now = time.time()
-    nxt = (int(now // 60) + 1) * 60 + offset_sec
-    time.sleep(max(0.0, nxt - now))
-
+# ============== main loop (tick scheduler) ==============
 def main():
-    broker = UpbitBroker(ACCESS, SECRET)
-    params_by_symbol = load_symbol_params()
-    feeds: Dict[str, Feed] = {s: Feed(s) for s in TICKERS}
-    strats: Dict[str, SymbolStrategy] = {s: SymbolStrategy(s, broker, params_by_symbol.get(s, {})) for s in TICKERS}
-    CB: Dict[str, CircuitBreaker] = {s: CircuitBreaker() for s in TICKERS}
+    if not ACCESS or not SECRET:
+        raise SystemExit("ACCESS/SECRET required.")
+    broker=UpbitBroker(ACCESS, SECRET)
+    params_by_symbol=load_symbol_params()
+    feeds={s: Feed(s) for s in TICKERS}
+    strats={s: SymbolStrategy(s, broker, params_by_symbol.get(s, {})) for s in TICKERS}
+    CB={s: CircuitBreaker() for s in TICKERS}
 
     logging.info("[init] started v3 armed bot")
-
-    # <<< One-shot reconcile from exchange >>>
     reconcile_from_exchange(strats, broker)
 
-    first_cycle = True
+    # Minute scheduler
+    next_min_tick = math.floor(time.time()/60)*60 + 60
     hb_t0 = time.time()
+
+    def minute_task(symbol: str):
+        """Fetch 1m, resample N, gate & armed-trigger once per minute (per symbol)."""
+        if CB[symbol].blocked(): return
+        df1 = feeds[symbol].fetch_1m_df(count=200)
+        if df1 is None or df1.empty: return
+        tf = int(strats[symbol].p["tf_base"])
+        dfN = resample_right_closed_ohlc(df1, tf)
+        if dfN is not None and not dfN.empty:
+            cur_idx=dfN.index[-1]
+            if strats[symbol].last_tf_idx is None or cur_idx != strats[symbol].last_tf_idx:
+                strats[symbol].on_bar_close_tf(dfN, CB[symbol])
+                strats[symbol].last_tf_idx = cur_idx
+                CB[symbol].ok()
+        if strats[symbol].state.is_armed:
+            strats[symbol].check_armed_trigger_1m(df1, CB[symbol])
 
     while True:
         try:
-            # === 1) Minute tick ===
-            if not first_cycle:
-                sleep_to_next_minute(offset_sec=0.8)
-            else:
-                first_cycle = False
+            now=time.time()
 
-            if halted():
-                logging.warning("[HALT] halt.flag detected. sleep 5s")
-                time.sleep(5)
-                continue
+            # ===== minute boundary: launch concurrent minute tasks =====
+            if now >= next_min_tick - 0.2:
+                start = time.time()
+                with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(TICKERS))) as ex:
+                    futs = {ex.submit(minute_task, s): s for s in TICKERS}
+                    for fut in as_completed(futs, timeout=MINUTE_TASK_DEADLINE):
+                        sym = futs[fut]
+                        try:
+                            fut.result(timeout=PER_TASK_TIMEOUT)
+                        except TimeoutError:
+                            CB[sym].fail("minute-timeout")
+                        except Exception as e:
+                            CB[sym].fail("minute-exc")
+                            logging.error(f"[{sym}] minute task error: {e}")
+                            logging.error(traceback.format_exc())
+                spent = time.time()-start
+                if spent>5:
+                    logging.info(f"[minute] tasks took {spent:.2f}s")
+                next_min_tick += 60  # schedule next minute
 
-            # Fetch 1m per symbol, resample N, process GATE, then check ARMED trigger
+            # ===== fast loop: every second manage intrabar =====
             for s in TICKERS:
                 try:
                     if CB[s].blocked(): continue
-                    df1 = feeds[s].fetch_1m_df(count=200)
-                    if df1 is None or df1.empty: continue
-
-                    tf = int(strats[s].p["tf_base"])
-                    dfN = resample_right_closed_ohlc(df1, tf)
-                    if dfN is not None and not dfN.empty:
-                        cur_idx = dfN.index[-1]
-                        if strats[s].last_tf_idx is None or cur_idx != strats[s].last_tf_idx:
-                            strats[s].on_bar_close_tf(dfN, CB[s])
-                            strats[s].last_tf_idx = cur_idx
-                            CB[s].ok()
-
-                    # Armed trigger once per minute
-                    if strats[s].state.is_armed:
-                        strats[s].check_armed_trigger_1m(df1, CB[s])
-
+                    bid, ask = broker.best_bid_ask(s)
+                    if strats[s].state.has_pos:
+                        strats[s].manage_intrabar(bid, ask)
+                    CB[s].ok()
                 except Exception as e:
-                    CB[s].fail("slow")
-                    logging.error(f"[{s}] slow loop error: {e}")
+                    CB[s].fail("fast")
+                    logging.error(f"[{s}] fast loop error: {e}")
                     logging.error(traceback.format_exc())
 
-            # === 2) Fast loop until next minute: manage positions only ===
-            deadline = (int(time.time() // 60) + 1) * 60 - 0.2
-            while time.time() < deadline:
-                for s in TICKERS:
-                    try:
-                        if CB[s].blocked(): continue
-                        bid, ask = broker.best_bid_ask(s)
-                        if strats[s].state.has_pos:
-                            strats[s].manage_intrabar(bid, ask)
-                        CB[s].ok()
-                    except Exception as e:
-                        CB[s].fail("fast")
-                        logging.error(f"[{s}] fast loop error: {e}")
-                        logging.error(traceback.format_exc())
+            # ===== heartbeat: strict cadence =====
+            if time.time() - hb_t0 >= HEARTBEAT_SEC:
+                lines=[]
+                for s, stg in strats.items():
+                    st=stg.state
+                    if st.has_pos:
+                        lines.append(f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={st.stop:.0f} tp1={int(st.tp1_done)}")
+                    elif st.is_armed:
+                        remain=int(max(0, st.armed_until - time.time()))
+                        lines.append(f"{s}: ARMED({remain}s) anchor={round_to_tick(st.armed_anchor_price):.0f}")
+                    else:
+                        lines.append(f"{s}: idle")
+                logging.info("[hb] " + " | ".join(lines))
+                heartbeat_file()
+                hb_t0 = time.time()
 
-                # Continuous heartbeat (every HEARTBEAT_SEC)
-                if time.time() - hb_t0 >= HEARTBEAT_SEC:
-                    lines = []
-                    for s, stg in strats.items():
-                        st = stg.state
-                        if st.has_pos:
-                            lines.append(
-                                f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={st.stop:.0f} tp1={int(st.tp1_done)}"
-                            )
-                        elif st.is_armed:
-                            remain = int(max(0, st.armed_until - time.time()))
-                            lines.append(
-                                f"{s}: ARMED({remain}s) anchor={round_to_tick(st.armed_anchor_price):.0f}"
-                            )
-                        else:
-                            lines.append(f"{s}: idle")
-                    logging.info("[hb] " + " | ".join(lines))
-                    heartbeat_file()
-                    hb_t0 = time.time()
+            # ===== halting =====
+            if halted():
+                logging.warning("[HALT] halt.flag detected; sleeping 5s")
+                time.sleep(5)
+                continue
 
-                time.sleep(POLL_SEC)
+            time.sleep(POLL_SEC)
 
         except KeyboardInterrupt:
-            logging.warning("[main] KeyboardInterrupt -> exit")
+            logging.warning("[main] KeyboardInterrupt → exit")
             break
         except Exception as e:
-            logging.error(f"[main] fatal error: {e}")
+            logging.error(f"[main] fatal: {e}")
             logging.error(traceback.format_exc())
             time.sleep(2)
 
 if __name__ == "__main__":
     main()
-
