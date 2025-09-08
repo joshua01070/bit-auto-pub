@@ -91,7 +91,7 @@ HALT_FILE = "halt.flag"
 HEARTBEAT_PATH = "heartbeat.txt"
 
 # =========================
-# 2) UTILITIES
+# 2) UTILITIES (PATCHED)
 # =========================
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 ensure_dir(STATE_DIR)
@@ -141,11 +141,25 @@ def safe_call(fn, *args, tries: int = 3, delay: float = 0.5, backoff: float = 1.
             t *= backoff
 
 def strip_partial_1m(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove current-minute row to guarantee closed 1m bars."""
-    if df is None or df.empty: return pd.DataFrame()
-    last_idx = df.index[-1]
-    now_min = pd.Timestamp.utcnow().floor("T")
-    if last_idx >= now_min:
+    """
+    Remove the *current-minute* row to guarantee closed 1m bars.
+    Upbit OHLCV index is usually tz-naive (KST). We compare using KST-naive time.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    idx: pd.DatetimeIndex = df.index  # assume DatetimeIndex
+    # last index as tz-naive in Asia/Seoul
+    if getattr(idx, "tz", None) is not None:
+        last_idx = idx.tz_convert("Asia/Seoul")[-1].tz_localize(None)
+    else:
+        last_idx = idx[-1]
+
+    # current minute (KST, tz-aware → tz-naive)
+    now_min_kst_naive = pd.Timestamp.now(tz="Asia/Seoul").floor("min").tz_localize(None)
+
+    # if last row belongs to the current (still-forming) minute, drop it
+    if last_idx >= now_min_kst_naive:
         return df.iloc[:-1].copy() if len(df) > 1 else df.iloc[:0].copy()
     return df
 
@@ -168,7 +182,7 @@ def sma(series: pd.Series, n: int) -> Optional[pd.Series]:
     return series.rolling(n, min_periods=n).mean()
 
 # =========================
-# 3) BROKER / FEED / GUARDS
+# 3) BROKER / FEED / GUARDS (PATCHED best_bid_ask)
 # =========================
 class CircuitBreaker:
     def __init__(self, max_fails=3, cool_sec=120):
@@ -198,8 +212,26 @@ class UpbitBroker:
 
     def best_bid_ask(self, ticker: str) -> Tuple[float, float]:
         ob = safe_call(pyupbit.get_orderbook, ticker)
-        units = ob[0]["orderbook_units"][0]
-        return float(units["bid_price"]), float(units["ask_price"])
+        units = None
+
+        if isinstance(ob, list) and ob:
+            # 정상: [ { "orderbook_units": [ {...}, ... ] } ]
+            units = (ob[0] or {}).get("orderbook_units", [])
+        elif isinstance(ob, dict):
+            # 간헐적으로 dict가 올 수도 있음: { "orderbook_units": [ ... ] } 혹은 에러포맷
+            units = ob.get("orderbook_units", [])
+
+        if not units:
+            # raise to let CB handle and cool down
+            raise RuntimeError("orderbook empty or malformed")
+
+        u0 = units[0]
+        bid = float(u0.get("bid_price", 0.0))
+        ask = float(u0.get("ask_price", 0.0))
+        if bid <= 0 or ask <= 0:
+            raise RuntimeError("invalid bid/ask from orderbook")
+
+        return bid, ask
 
     def buy_market_krw(self, ticker: str, krw: float) -> dict:
         return safe_call(self.up.buy_market_order, ticker, krw)
@@ -395,7 +427,7 @@ class SymbolStrategy:
         if int(self.p.get("armed_enable", 0)) == 0:
             # legacy: immediate entry
             if not self.state.has_pos and break_pass and ma_pass and not cb.blocked():
-                logging.info(f"[{self.symbol}] [LEGACY-ENTER] 5m pass → BUY")
+                logging.info(f"[{self.symbol}] [LEGACY-ENTER] {int(self.p['tf_base'])}m pass → BUY")
                 self._enter_position(cb, "LEGACY")
             return
 
@@ -715,11 +747,7 @@ def main():
                         logging.error(f"[{s}] fast loop error: {e}")
                         logging.error(traceback.format_exc())
                 # heartbeat & wait
-                try:
-                    with open(HEARTBEAT_PATH, "w") as f:
-                        f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
-                except Exception:
-                    pass
+                heartbeat()
                 time.sleep(POLL_SEC)
 
         except KeyboardInterrupt:
