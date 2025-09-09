@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_coin_auto_trade_live_final_v3_armed.py
+multi_coin_auto_trade_live_final_v3_armed.py  (patched & finalized)
 
 LIVE trading bot for "MTF Gating + 1m Armed Entry".
 - Backfilling 1m feed cache (no more 200-bar limit) with gaps/length diagnostics.
-- Minute tasks (fetch 1m, resample N, gate, armed-trigger) run concurrently per symbol.
+- Minute tasks (fetch 1m, resample N, gate, armed-trigger) run concurrently per symbol (non-blocking).
 - Fast loop (intrabar manage) runs every second regardless of minute tasks.
 - "Next 1m open" optional execution for ARMED trigger (backtest-timing compatible).
 - Non-loosening stop invariant.
@@ -20,12 +20,21 @@ Backtest parity targets (align with backtest_breakout_partial_final_armed.py):
 - Armed anchor = max(Donch upper, prev N-min close).
 - Optional execution at next 1m open on trigger (ARMED_EXEC=next_open).
 - Rounding via price_unit/round_price throughout.
+
+Patched changes (summary):
+- trail_after applied after TP1 (tp1_done=True).
+- HALT blocks only new entries/arming/pending-buys (does NOT stall loop; stops/TP/PTP keep working).
+- Partial-sell minKRW check (skip too-small partials; allow final-all).
+- qty_step enforced for sells & PTP.
+- BUY_LOCK to serialize buys across symbols (avoid KRW oversubscribe).
+- Pending buy respects CircuitBreaker; if blocked, postpone to next 1m.
+- HALT prevents arming/trigger opening; pending buys canceled during HALT.
 """
 
-import os, time, json, math, logging, traceback, uuid
+import os, time, json, math, logging, traceback, uuid, threading
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
 import logging.handlers
 
 import pandas as pd
@@ -107,8 +116,10 @@ ARMED_EXEC        = os.getenv("ARMED_EXEC", "next_open").lower()  # "next_open" 
 
 # minute task pool
 FETCH_WORKERS = min(3, len(TICKERS))     # conservative
-MINUTE_TASK_DEADLINE = 15.0              # seconds cap for all minute tasks
 PER_TASK_TIMEOUT = 6.0                   # per-symbol minute task timeout
+
+# === BUY serialization across symbols (avoid KRW oversubscribe)
+BUY_LOCK = threading.Lock()
 
 # ========================= utils =========================
 def patch_pyupbit_timeout():
@@ -408,7 +419,12 @@ class SymbolStrategy:
         except Exception as e:
             logging.warning(f"[{self.symbol}] state save error: {e}")
 
-    def _trail_step(self) -> float: return float(self.p.get("trail_before", 0.08))
+    # === Patched: TP1 이후 trail_after 사용
+    def _trail_step(self) -> float:
+        before = float(self.p.get("trail_before", 0.08))
+        after  = float(self.p.get("trail_after",  0.08))
+        return after if bool(self.state.tp1_done) else before
+
     def _raise_stop(self, candidate: float):
         if candidate and candidate > (self.state.stop or 0.0):
             self.state.stop = candidate; self._save_state()
@@ -448,18 +464,32 @@ class SymbolStrategy:
     # ----- ENTER / EXIT -----
     def _enter_position(self, cb: CircuitBreaker, reason: str):
         try:
-            if self.state.has_pos: return
-            total_krw = self.broker.krw_balance()
-            amt = total_krw * float(self.p["buy_pct"])
-            if amt < float(self.p["min_krw_order"]):
-                logging.info(f"[{self.symbol}] [SKIP] low budget {amt:.0f}")
-                log_event("skip_buy", symbol=self.symbol, reason="low_budget", krw=amt)
+            if self.state.has_pos:
                 return
-            resp = self.broker.buy_market_krw(self.symbol, amt)
-            uuid_ = str(resp.get("uuid",""))
-            log_event("order_submitted", side="buy", symbol=self.symbol, uuid=uuid_, krw=amt, reason=reason)
-            if not uuid_:
-                cb.fail("buy-uuid"); logging.error(f"[{self.symbol}] BUY no uuid"); return
+            # HALT: block new entries
+            if os.path.exists(HALT_FILE):
+                logging.info(f"[{self.symbol}] [SKIP] HALT (entry blocked)")
+                log_event("skip_buy", symbol=self.symbol, reason="halt")
+                return
+            if cb.blocked():
+                logging.info(f"[{self.symbol}] [SKIP] CB blocked (entry)")
+                log_event("skip_buy", symbol=self.symbol, reason="cb_blocked")
+                return
+
+            # serialize buys to avoid KRW oversubscribe
+            with BUY_LOCK:
+                total_krw = self.broker.krw_balance()
+                amt = total_krw * float(self.p["buy_pct"])
+                if amt < float(self.p["min_krw_order"]):
+                    logging.info(f"[{self.symbol}] [SKIP] low budget {amt:.0f}")
+                    log_event("skip_buy", symbol=self.symbol, reason="low_budget", krw=amt)
+                    return
+                resp = self.broker.buy_market_krw(self.symbol, amt)
+                uuid_ = str(resp.get("uuid",""))
+                log_event("order_submitted", side="buy", symbol=self.symbol, uuid=uuid_, krw=amt, reason=reason)
+                if not uuid_:
+                    cb.fail("buy-uuid"); logging.error(f"[{self.symbol}] BUY no uuid"); return
+
             qty, avg = self._resolve_buy_fill(uuid_)
             if qty<=0 or avg<=0:
                 cb.fail("buy-nofill"); logging.error(f"[{self.symbol}] BUY no fill"); return
@@ -477,7 +507,20 @@ class SymbolStrategy:
     def _sell(self, qty: float, reason: str):
         try:
             qty = min(qty, self.state.qty)
+            # qty step
+            qty = floor_to_step(qty, float(self.p.get("qty_step", 1e-8)))
             if qty<=0: return
+
+            # partial sell minKRW check (except when liquidating all)
+            is_last = abs(qty - self.state.qty) <= 1e-12
+            try:
+                bid, _ = self.broker.best_bid_ask(self.symbol)
+                if (not is_last) and (bid * qty) < float(self.p.get("min_krw_order", 6000.0)):
+                    logging.info(f"[{self.symbol}] [SELL-skip] partial notional<{self.p.get('min_krw_order')} ({bid*qty:.1f})")
+                    return
+            except Exception as e:
+                logging.warning(f"[{self.symbol}] [SELL] best_bid_ask failed; proceed anyway: {e}")
+
             resp = self.broker.sell_market(self.symbol, qty)
             uuid_ = str(resp.get("uuid",""))
             log_event("order_submitted", side="sell", symbol=self.symbol, uuid=uuid_, qty=qty, reason=reason)
@@ -496,6 +539,11 @@ class SymbolStrategy:
 
     # ----- GATE (N-min close) -----
     def on_bar_close_tf(self, dfN: pd.DataFrame, cb: CircuitBreaker):
+        # HALT: skip gating/arming window opening
+        if os.path.exists(HALT_FILE):
+            logging.info(f"[{self.symbol}] [HALT] gate skipped")
+            return
+
         n = int(self.p["don_n"]); ma_l = int(self.p["ma_l"]); ma_s_v = int(self.p["ma_s"])
         if LOG_DATA_DIAG:
             logging.info(f"[{self.symbol}] [gate-diag] barsN={len(dfN)} need_don>={n+1} need_ma_l>={ma_l+1}")
@@ -538,6 +586,9 @@ class SymbolStrategy:
 
     # ----- TRIGGER (1m, once per minute) -----
     def check_armed_trigger_1m(self, df1m: pd.DataFrame, cb: CircuitBreaker):
+        # HALT: ignore triggers
+        if os.path.exists(HALT_FILE):
+            return
         if not self.state.is_armed: return
         now_t = time.time()
         if now_t >= self.state.armed_until:
@@ -559,7 +610,7 @@ class SymbolStrategy:
             return
 
         # invalidate if 1m low pierces anchor*(1-inval)
-        if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):
+        if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):  # <= to be conservative
             self.state.is_armed=False; self._save_state()
             logging.info(f"[{self.symbol}] [DISARMED] low<=anchor")
             log_event("armed_close", symbol=self.symbol, reason="anchor_break")
@@ -588,11 +639,21 @@ class SymbolStrategy:
 
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
-        # pending next-open buy (safety: execute when time reached)
-        if (not self.state.has_pos) and (self.state.pending_buy_ts > 0.0) and (time.time() >= self.state.pending_buy_ts):
-            self._enter_position(cb, "ARMED-NEXTOPEN")
+        # HALT: cancel pending-buy; do NOT block stops/TP/PTP
+        if os.path.exists(HALT_FILE) and self.state.pending_buy_ts > 0.0:
+            logging.info(f"[{self.symbol}] [HALT] pending-buy canceled")
             self.state.pending_buy_ts = 0.0
             self._save_state()
+
+        # pending next-open buy (safety: execute when time reached, CB-aware)
+        if (not self.state.has_pos) and (self.state.pending_buy_ts > 0.0) and (time.time() >= self.state.pending_buy_ts):
+            if cb.blocked():
+                self.state.pending_buy_ts = math.floor(time.time()/60)*60 + 60  # postpone 1m
+                self._save_state()
+            else:
+                self._enter_position(cb, "ARMED-NEXTOPEN")
+                self.state.pending_buy_ts = 0.0
+                self._save_state()
 
         if not self.state.has_pos: return
         trail=self._trail_step(); high_now=max(bid,ask)
@@ -604,14 +665,18 @@ class SymbolStrategy:
                 if lv in (self.state.ptp_hits or []): continue
                 tgt=round_price(self.state.avg*(1.0+lv), "down")
                 if high_now>=tgt and self.state.qty>0:
-                    sell_qty=min(self.state.init_qty*float(fr), self.state.qty)
-                    if sell_qty>0:
-                        self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
-                        (self.state.ptp_hits or []).append(lv)
-                        if int(self.p.get("ptp_be",0))==1:
-                            be=self.state.avg*(1.0+float(self.p["fee"])+float(self.p["eps_exec"]))
-                            self._raise_stop(round_price(be, "up"))
-                            self.state.tp1_done=True; self._save_state()
+                    sell_qty = floor_to_step(min(self.state.init_qty*float(fr), self.state.qty), float(self.p.get("qty_step", 1e-8)))
+                    if sell_qty > 0:
+                        is_last = abs(sell_qty - self.state.qty) <= 1e-12
+                        if (not is_last) and (bid * sell_qty) < float(self.p.get("min_krw_order", 6000.0)):
+                            logging.info(f"[{self.symbol}] [PTP-skip] partial notional<{self.p.get('min_krw_order')} (lv={lv}, fr={fr})")
+                        else:
+                            self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
+                            (self.state.ptp_hits or []).append(lv)
+                            if int(self.p.get("ptp_be",0))==1:
+                                be=self.state.avg*(1.0+float(self.p["fee"])+float(self.p["eps_exec"]))
+                                self._raise_stop(round_price(be, "up"))
+                                self.state.tp1_done=True; self._save_state()
 
         # TP
         tp=float(self.p.get("tp_rate",0.0))
@@ -634,7 +699,7 @@ def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBrok
                 stg.state.has_pos=True; stg.state.qty=qty; stg.state.avg=avg
                 stg.state.init_qty=qty; stg.state.ptp_hits=[]; stg.state.tp1_done=False
                 stg.state.is_armed=False; stg.state.pending_buy_ts=0.0
-                stg._raise_stop(round_price(avg*(1.0-stg._trail_step()), "down"))
+                stg._raise_stop(round_price(avg*(1.0+stg._trail_step()), "down"))
                 stg._save_state()
                 logging.info(f"[{sym}] [RECONCILE] qty={qty:.8f}, avg={avg:.0f}")
                 log_event("reconcile_pos", symbol=sym, qty=qty, avg=avg)
@@ -696,7 +761,7 @@ def main():
         """Fetch 1m (backfill), resample N, gate & armed-trigger once per minute (per symbol)."""
         if CB[symbol].blocked(): return
         p = strats[symbol].p
-        need_1m_total, need_tf_bars, need_1m_for_armed = compute_need_1m(p)
+        need_1m_total, need_tf_bars, _ = compute_need_1m(p)
 
         # 1) 1m ensure length
         df1 = feeds[symbol].fetch_1m_needed(need_minutes=need_1m_total)
@@ -713,13 +778,10 @@ def main():
 
         # 3) readiness
         ready_gate  = len(dfN) >= need_tf_bars
-        ready_armed = len(df1) >= need_1m_total  # parity-aligned
         reasons = []
         if not ready_gate:  reasons.append(f"short_tfN({len(dfN)}/{need_tf_bars})")
-        if int(p.get("armed_enable",0))==1 and not ready_armed:
-            reasons.append(f"short_armed1m({len(df1)}/{need_1m_total})")
 
-        cur_state = "READY" if (ready_gate and (int(p.get("armed_enable",0))==0 or ready_armed)) else "NOT_READY"
+        cur_state = "READY" if ready_gate else "NOT_READY"
         if LOG_DATA_DIAG:
             state_str = cur_state if cur_state=="READY" else (cur_state+":"+",".join(reasons))
             logging.info(f"[{symbol}] [diag] tf={tf}m dfN={len(dfN)} needN>={need_tf_bars} | df1m={len(df1)} need1m>={need_1m_total} | {state_str}")
@@ -741,87 +803,94 @@ def main():
         if strats[symbol].state.is_armed:
             strats[symbol].check_armed_trigger_1m(df1, CB[symbol])
 
-    while True:
-        try:
-            now=time.time()
+    # ---- minute task executor (non-blocking) ----
+    minute_pool = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
+    pending: Dict[str, Tuple[Any, float]] = {}  # symbol -> (future, start_ts)
 
-            # ===== minute boundary: launch concurrent minute tasks AFTER boundary =====
-            if now >= next_min_tick:
-                start = time.time()
-                with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(TICKERS))) as ex:
-                    futs = {ex.submit(minute_task, s): s for s in TICKERS}
-                    try:
-                        for fut in as_completed(futs, timeout=MINUTE_TASK_DEADLINE):
-                            sym = futs[fut]
+    try:
+        while True:
+            try:
+                now=time.time()
+
+                # ===== minute boundary: schedule concurrent minute tasks (non-blocking) =====
+                if now >= next_min_tick:
+                    # housekeeping old futures (timeout/exception)
+                    for s, pack in list(pending.items()):
+                        fut, t0 = pack
+                        # timeout handling (non-blocking check)
+                        if not fut.done() and (now - t0) > PER_TASK_TIMEOUT:
+                            CB[s].fail("minute-timeout")
+                        if fut.done():
                             try:
-                                fut.result(timeout=PER_TASK_TIMEOUT)
-                            except TimeoutError:
-                                CB[sym].fail("minute-timeout")
+                                fut.result(timeout=0.001)
                             except Exception as e:
-                                CB[sym].fail("minute-exc")
-                                logging.error(f"[{sym}] minute task error: {e}")
+                                CB[s].fail("minute-exc")
+                                logging.error(f"[{s}] minute task error: {e}")
                                 logging.error(traceback.format_exc())
-                    except TimeoutError:
-                        # outer timeout: mark unfinished ones
-                        for fut, sym in futs.items():
-                            if not fut.done():
-                                CB[sym].fail("minute-timeout-outer")
-                spent = time.time()-start
-                if spent>5:
-                    logging.info(f"[minute] tasks took {spent:.2f}s")
-                # catch-up precisely
-                now2 = time.time()
-                while next_min_tick <= now2:
-                    next_min_tick += 60
+                            finally:
+                                pending.pop(s, None)
 
-            # ===== fast loop: every second manage intrabar =====
-            for s in TICKERS:
-                try:
-                    if CB[s].blocked(): continue
-                    bid, ask = broker.best_bid_ask(s)
-                    # manage pending buy and trailing/ptp/ts
-                    strats[s].manage_intrabar(bid, ask, CB[s])
-                    CB[s].ok()
-                except Exception as e:
-                    CB[s].fail("fast")
-                    logging.error(f"[{s}] fast loop error: {e}")
-                    logging.error(traceback.format_exc())
+                    # submit new tasks for all symbols
+                    for s in TICKERS:
+                        # if previous still running, skip resubmit this minute (prevent pile-up)
+                        if s in pending and not pending[s][0].done():
+                            continue
+                        pending[s] = (minute_pool.submit(minute_task, s), now)
 
-            # ===== heartbeat: absolute schedule, no drift =====
-            now = time.time()
-            if now >= next_hb_tick:
-                lines=[]
-                for s, stg in strats.items():
-                    st=stg.state
-                    if st.has_pos:
-                        lines.append(f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={round_price(st.stop,'down'):.0f} tp1={int(st.tp1_done)}")
-                    elif st.is_armed:
-                        remain=int(max(0, st.armed_until - now))
-                        lines.append(f"{s}: ARMED({remain}s) anchor={round_price(st.armed_anchor_price,'down'):.0f}")
-                    else:
-                        lines.append(f"{s}: idle")
-                logging.info("[hb] " + " | ".join(lines))
-                heartbeat_file()
-                while next_hb_tick <= now:
-                    next_hb_tick += HEARTBEAT_SEC
+                    # schedule next minute (catch-up precisely)
+                    now2 = time.time()
+                    while next_min_tick <= now2:
+                        next_min_tick += 60
 
-            # ===== halting =====
-            if os.path.exists(HALT_FILE):
-                logging.warning("[HALT] halt.flag detected; sleeping 5s")
-                time.sleep(5)
-                continue
+                # ===== fast loop: every second manage intrabar =====
+                for s in TICKERS:
+                    try:
+                        if CB[s].blocked(): continue
+                        bid, ask = broker.best_bid_ask(s)
+                        # manage pending buy and trailing/ptp/ts
+                        strats[s].manage_intrabar(bid, ask, CB[s])
+                        CB[s].ok()
+                    except Exception as e:
+                        CB[s].fail("fast")
+                        logging.error(f"[{s}] fast loop error: {e}")
+                        logging.error(traceback.format_exc())
 
-            time.sleep(POLL_SEC)
+                # ===== heartbeat: absolute schedule, no drift =====
+                now = time.time()
+                if now >= next_hb_tick:
+                    lines=[]
+                    for s, stg in strats.items():
+                        st=stg.state
+                        if st.has_pos:
+                            lines.append(f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={round_price(st.stop,'down'):.0f} tp1={int(st.tp1_done)}")
+                        elif st.is_armed:
+                            remain=int(max(0, st.armed_until - now))
+                            lines.append(f"{s}: ARMED({remain}s) anchor={round_price(st.armed_anchor_price,'down'):.0f}")
+                        else:
+                            lines.append(f"{s}: idle")
+                    logging.info("[hb] " + " | ".join(lines))
+                    heartbeat_file()
+                    while next_hb_tick <= now:
+                        next_hb_tick += HEARTBEAT_SEC
 
-        except KeyboardInterrupt:
-            logging.warning("[main] KeyboardInterrupt → exit")
-            log_event("shutdown", reason="keyboard")
-            break
-        except Exception as e:
-            logging.error(f"[main] fatal: {e}")
-            logging.error(traceback.format_exc())
-            log_event("fatal", error=str(e))
-            time.sleep(2)
+                # ===== halting =====
+                if os.path.exists(HALT_FILE):
+                    # do not block loop; entry/arming is handled inside strategy methods
+                    pass
+
+                time.sleep(POLL_SEC)
+
+            except KeyboardInterrupt:
+                logging.warning("[main] KeyboardInterrupt → exit")
+                log_event("shutdown", reason="keyboard")
+                break
+            except Exception as e:
+                logging.error(f"[main] fatal: {e}")
+                logging.error(traceback.format_exc())
+                log_event("fatal", error=str(e))
+                time.sleep(2)
+    finally:
+        minute_pool.shutdown(wait=False)
 
 if __name__ == "__main__":
     main()
