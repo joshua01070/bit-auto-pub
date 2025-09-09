@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_coin_auto_trade_live_final_v3_armed.py  (final with visibility + 2 safety patches)
+multi_coin_auto_trade_live_final_v3_armed.py  (final with safety + backfill fixes + prewarm)
 
 LIVE trading bot for "MTF Gating + 1m Armed Entry".
-- Backfilling 1m feed cache (no more 200-bar limit) with gaps/length diagnostics.
+- Backfilling 1m feed cache with multi-page pagination (<=200/req), robust gap/length diagnostics.
 - Minute tasks (fetch 1m, resample N, gate, armed-trigger) run concurrently per symbol (non-blocking).
 - Fast loop (intrabar manage) runs every second regardless of minute tasks.
 - "Next 1m open" optional execution for ARMED trigger (backtest-timing compatible).
@@ -21,13 +21,12 @@ Backtest parity targets (align with backtest_breakout_partial_final_armed.py):
 - Optional execution at next 1m open on trigger (ARMED_EXEC=next_open).
 - Rounding via price_unit/round_price throughout.
 
-Patched changes (visibility & safety):
-- (1) Readiness diag에 short_armed1m(...) 복원.
-- (2) LOG_TRAIL=1 시, stop 상승(트레일/BE) 로그 출력. BE 상승 시 [BE] 라인 고정 출력.
-- (3) 하트비트는 기존 그대로(포지션/stop/tp1/armed), 옵션으로 KRW 잔고도 쉽게 추가 가능.
-- (4) 기능 변화 없음; 진단 가시성만 강화.
-- (+) 추가 패치 A: fast loop에서 ARMED 윈도우 시간 만료 즉시 닫기.
-- (+) 추가 패치 B: 호가 조회 실패 시 부분청산은 스킵, 마지막 전량청산만 진행.
+Patched changes:
+- Visibility: readiness diag에 short_armed1m(...) 포함, LOG_TRAIL=1 시 stop 인상/BE 로그 강화.
+- Safety A: fast loop에서 ARMED 윈도우 시간 만료 즉시 닫기.
+- Safety B: 호가 조회 실패 시 부분청산 스킵, 마지막 전량청산만 진행.
+- Backfill Fix: pagination 시 `to = (oldest - 1s)` 커서로 과거 페이지 강제 전진.
+- Prewarm: 부팅 시 필요 길이까지 즉시 백필(ENV: LIVE_PREWARM=1 기본 on).
 """
 
 import os, time, json, math, logging, traceback, uuid, threading
@@ -91,7 +90,7 @@ SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
                 "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
                 "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-SOL": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 45, "don_n": 96,
-                "buy_pct": 0.25, "trail_before": 0.08, "trail_after": 0.08,
+                "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
                 "ptp_levels": "", "tp_rate": 0.03,  "fast_seq": "HL",
                 "armed_enable": 1, "armed_micro_trigger": "REBREAK",
                 "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
@@ -113,6 +112,7 @@ NEED_BUF_1M    = int(os.getenv("LIVE_NEED_BUF_1M", "60"))
 FETCH_PAGE     = int(os.getenv("LIVE_FETCH_COUNT", "200"))  # <=200 per pyupbit limit
 MAX_CACHE_MIN  = int(os.getenv("LIVE_MAX_CACHE_MIN", "5000"))
 ARMED_EXEC     = os.getenv("ARMED_EXEC", "next_open").lower()  # "next_open" | "immediate"
+PREWARM_AT_BOOT = int(os.getenv("LIVE_PREWARM", "1"))  # 부팅 시 필요 길이까지 즉시 백필
 
 # minute task pool
 FETCH_WORKERS    = min(3, len(TICKERS))     # conservative
@@ -216,7 +216,8 @@ class CircuitBreaker:
         self.max_fails, self.cool_sec = max_fails, cool_sec
         self.fail_count = 0
         self.block_until = 0.0
-    def blocked(self) -> bool: return time.time() < self.block_until
+    def blocked(self) -> bool:
+        return time.time() < self.block_until
     def ok(self):
         if self.fail_count != 0 or self.blocked():
             log_event("cb_ok")
@@ -306,7 +307,10 @@ class Feed:
     def _pull(self, to_ts: Optional[pd.Timestamp] = None, count: int = FETCH_PAGE) -> pd.DataFrame:
         kw = {"interval": "minute1", "count": min(int(count), 200)}
         if to_ts is not None:
-            kw["to"] = to_ts.strftime("%Y-%m-%d %H:%M:%S")  # KST naive acceptable for pyupbit
+            # ensure KST naive for pyupbit
+            if getattr(to_ts, "tzinfo", None) is not None:
+                to_ts = to_ts.tz_convert("Asia/Seoul").tz_localize(None)
+            kw["to"] = to_ts.strftime("%Y-%m-%d %H:%M:%S")
         tmp = safe_call(pyupbit.get_ohlcv, self.ticker, **kw)
         df = tmp if isinstance(tmp, pd.DataFrame) else pd.DataFrame()
         if df.empty: return df
@@ -326,16 +330,32 @@ class Feed:
             self._cache = self._cache.iloc[-MAX_CACHE_MIN:]
 
     def _backfill_until(self, min_len: int, limit: int = BACKFILL_LIMIT):
+        # Cursor-based pagination: to = (oldest - 1s)
+        if self._cache is None or self._cache.empty:
+            return
         tries = 0
-        while self._cache is not None and len(self._cache) < min_len and tries < limit:
-            oldest = self._cache.index[0]
-            older = self._pull(oldest)
+        cursor = self._cache.index[0] - pd.Timedelta(seconds=1)
+        prev_len = len(self._cache)
+
+        while len(self._cache) < min_len and tries < limit:
+            older = self._pull(cursor)
+            got = 0 if (older is None or older.empty) else len(older)
+            logging.info(f"[{self.ticker}] [backfill] try={tries+1}/{limit} to={cursor} got={got}")
+
             if older is None or older.empty:
                 break
+
             self._cache = pd.concat([older, self._cache]).sort_index()
             self._cache = self._cache[~self._cache.index.duplicated(keep="last")]
+
+            cursor = self._cache.index[0] - pd.Timedelta(seconds=1)
             tries += 1
-            time.sleep(0.25)
+
+            if len(self._cache) == prev_len:
+                cursor = cursor - pd.Timedelta(minutes=200)  # defensive jump
+            prev_len = len(self._cache)
+
+            time.sleep(0.15)
 
     def fetch_1m_needed(self, need_minutes: int) -> pd.DataFrame:
         self._sync_latest()
@@ -525,7 +545,7 @@ class SymbolStrategy:
                     logging.info(f"[{self.symbol}] [SELL-skip] partial notional<{self.p.get('min_krw_order')} ({bid*qty:.1f})")
                     return
             except Exception as e:
-                # PATCH B: 호가 확인 실패 시 부분청산은 스킵, 마지막 전량만 진행
+                # Safety B: only allow last-all when bid lookup fails
                 if not is_last:
                     logging.warning(f"[{self.symbol}] [SELL-skip] no bid for partial; {e}")
                     return
@@ -649,7 +669,7 @@ class SymbolStrategy:
 
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
-        # PATCH A: time-based ARMED expiry even if minute_task skipped (e.g., CB blocked)
+        # Safety A: time-based ARMED expiry even if minute_task skipped
         if self.state.is_armed and time.time() >= (self.state.armed_until or 0.0):
             self.state.is_armed = False
             self._save_state()
@@ -717,7 +737,6 @@ def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBrok
                 stg.state.has_pos=True; stg.state.qty=qty; stg.state.avg=avg
                 stg.state.init_qty=qty; stg.state.ptp_hits=[]; stg.state.tp1_done=False
                 stg.state.is_armed=False; stg.state.pending_buy_ts=0.0
-                # initial protective stop below avg (trail_before/after handled)
                 stg._raise_stop(round_price(avg*(1.0-stg._trail_step()), "down"))
                 stg._save_state()
                 logging.info(f"[{sym}] [RECONCILE] qty={qty:.8f}, avg={avg:.0f}")
@@ -756,6 +775,15 @@ def compute_need_1m(p: Dict[str, Any]) -> Tuple[int,int,int]:
     need_1m_total = max(need_1m_from_tf, need_1m_for_armed) + NEED_BUF_1M
     return need_1m_total, need_tf_bars, need_1m_for_armed
 
+# ========================= prewarm (optional at boot) =========================
+def prewarm_at_boot(feeds: Dict[str, 'Feed'], strats: Dict[str, 'SymbolStrategy']):
+    for s in TICKERS:
+        p = strats[s].p
+        need_1m_total, _, _ = compute_need_1m(p)
+        df = feeds[s].fetch_1m_needed(need_minutes=need_1m_total)
+        logging.info(f"[{s}] [prewarm] 1m={len(df)} / need={need_1m_total}")
+        log_event("prewarm_done", symbol=s, have=len(df), need=need_1m_total)
+
 # ========================= main loop (tick scheduler) =========================
 def main():
     if not ACCESS or not SECRET:
@@ -769,6 +797,10 @@ def main():
     logging.info(f"[init] started v3 armed bot RUN_ID={RUN_ID}")
     log_event("boot", tickers=TICKERS, run_id=RUN_ID)
     reconcile_from_exchange(strats, broker)
+
+    # Prewarm: fetch needed minutes immediately
+    if PREWARM_AT_BOOT:
+        prewarm_at_boot(feeds, strats)
 
     # ===== Absolute schedules (no drift) =====
     next_min_tick = (int(time.time() // 60) + 1) * 60
@@ -795,7 +827,7 @@ def main():
             if LOG_DATA_DIAG: logging.info(f"[{symbol}] [diag] dfN empty (tf={tf}m)")
             return
 
-        # 3) readiness (short_armed1m 복원)
+        # 3) readiness (short_armed1m 포함)
         ready_gate  = len(dfN) >= need_tf_bars
         ready_armed = True
         if int(p.get("armed_enable",0))==1:
