@@ -1,41 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-multi_coin_auto_trade_live_final_v3_armed.py
-(final: robust backfill + prewarm + state-locking + inflight-guard + PTP-throttle)
-
-LIVE trading bot for "MTF Gating + 1m Armed Entry".
-- Backfilling 1m feed cache with multi-page pagination (<=200/req), robust gap/length diagnostics.
-- Boot prewarm to required minutes (optional, default ON).
-- Minute tasks (fetch 1m, resample N, gate, armed-trigger) run concurrently per symbol (non-blocking).
-- Fast loop (intrabar manage) runs every second regardless of minute tasks.
-- "Next 1m open" optional execution for ARMED trigger (backtest-timing compatible).
-- Non-loosening stop invariant.
-- Startup reconcile from exchange as single source of truth.
-- Heartbeat guaranteed every HEARTBEAT_SEC, no drift.
-- Text logs + JSONL event logs for audit/analysis (lightweight, transition-focused).
-
-Backtest parity targets (align with backtest_breakout_partial_final_armed.py):
-- Donchian upper uses previous n bars (excluding current).
-- Gating at just-closed N-minute bar, resample(label='right', closed='right').
-- Entry buffer = upper + price_unit(upper) * entry_tick_buffer.
-- Armed anchor = max(Donch upper, prev N-min close).
-- Optional execution at next 1m open on trigger (ARMED_EXEC=next_open).
-- Rounding via price_unit/round_price throughout.
-
-Patch summary (this build):
-1) State race fix:
-   - Per-symbol RLock + "state 객체 교체 금지" (in-place reset).
-   - 모든 상태 쓰기 구간 잠금(파일저장 포함). 네트워크 호출은 가급적 락 밖.
-2) PTP 미달 반복/로그 스팸 방지:
-   - 수준별(deferred) 스로틀(기본 60s) + 미달 시 히트 미기록 유지(안전).
-   - 실제 체결 성공 시에만 ptp_hits/BE 적용.
-3) 체결 타임아웃 중복매수 방지(기회 재시도 유지):
-   - 매수 직전 잔고 스냅샷으로 선제 리컨실.
-   - 주문 uuid 보관(pending_buy_uuid) + 짧은 buy_guard_until (90s).
-   - 단, guard 중이라도 "거래소 잔고가 여전히 0"이면 재시도 허용.
-
-"""
 
 import os, time, json, math, logging, traceback, uuid, threading
 from dataclasses import dataclass, asdict
@@ -98,7 +60,7 @@ SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
                 "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
                 "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-SOL": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 45, "don_n": 96,
-                "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
+                "buy_pct": 0.25, "trail_before": 0.08, "trail_after": 0.08,
                 "ptp_levels": "", "tp_rate": 0.03,  "fast_seq": "HL",
                 "armed_enable": 1, "armed_micro_trigger": "REBREAK",
                 "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
@@ -701,6 +663,7 @@ class SymbolStrategy:
         prev_close = float(closes.iloc[-1])                     # just-closed N-min close
 
         ma_pass=True
+        ms = ml = None
         if int(self.p["use_ma"])==1:
             ms=sma(closes,ma_s_v); ml=sma(closes,ma_l)
             if ms is None or ml is None or pd.isna(ms.iloc[-1]) or pd.isna(ml.iloc[-1]) or ms.iloc[-1] <= ml.iloc[-1]:
@@ -708,6 +671,38 @@ class SymbolStrategy:
 
         up_buf = upper + price_unit(upper)*int(self.p.get("entry_tick_buffer",2))
         break_pass = prev_close > up_buf
+
+        # [gate-check] 상세 로그: 어떤 조건이 통과/미통과였는지 수치와 함께 출력
+        if LOG_DATA_DIAG:
+            try:
+                msg = (f"[{self.symbol}] [gate-check] "
+                       f"break_pass={bool(break_pass)} "
+                       f"(prev_close={round_price(prev_close,'down'):.0f} "
+                       f"> up_buf={round_price(up_buf,'down'):.0f} "
+                       f"from upper={round_price(upper,'down'):.0f}) | "
+                       f"ma_pass={bool(ma_pass)}")
+                if int(self.p['use_ma'])==1 and ms is not None and ml is not None \
+                   and not pd.isna(ms.iloc[-1]) and not pd.isna(ml.iloc[-1]):
+                    msg += f" (ms={float(ms.iloc[-1]):.2f} > ml={float(ml.iloc[-1]):.2f})"
+                logging.info(msg)
+            except Exception:
+                logging.info(f"[{self.symbol}] [gate-check] break_pass={break_pass} ma_pass={ma_pass}")
+
+        # 게이트 실패 사유 이벤트 (flat & unarmed 상태에서만)
+        with self._lock:
+            flat_unarmed = (not self.state.has_pos) and (not self.state.is_armed)
+        if flat_unarmed and not (break_pass and ma_pass):
+            reasons = []
+            if not break_pass: reasons.append("no_break")
+            if not ma_pass:    reasons.append("ma_filter")
+            reason = "&".join(reasons) or "unknown"
+            try:
+                log_event("gate_noarm", symbol=self.symbol, reason=reason,
+                          upper=float(upper), up_buf=float(up_buf), prev_close=float(prev_close),
+                          ms=(float(ms.iloc[-1]) if ms is not None and not pd.isna(ms.iloc[-1]) else None),
+                          ml=(float(ml.iloc[-1]) if ml is not None and not pd.isna(ml.iloc[-1]) else None))
+            except Exception:
+                log_event("gate_noarm", symbol=self.symbol, reason=reason)
 
         if int(self.p.get("armed_enable",0))==0:
             with self._lock:
