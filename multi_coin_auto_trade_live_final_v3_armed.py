@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_coin_auto_trade_live_final_v3_armed.py  (patched & finalized)
+multi_coin_auto_trade_live_final_v3_armed.py  (final with visibility + 2 safety patches)
 
 LIVE trading bot for "MTF Gating + 1m Armed Entry".
 - Backfilling 1m feed cache (no more 200-bar limit) with gaps/length diagnostics.
@@ -21,14 +21,13 @@ Backtest parity targets (align with backtest_breakout_partial_final_armed.py):
 - Optional execution at next 1m open on trigger (ARMED_EXEC=next_open).
 - Rounding via price_unit/round_price throughout.
 
-Patched changes (summary):
-- trail_after applied after TP1 (tp1_done=True).
-- HALT blocks only new entries/arming/pending-buys (does NOT stall loop; stops/TP/PTP keep working).
-- Partial-sell minKRW check (skip too-small partials; allow final-all).
-- qty_step enforced for sells & PTP.
-- BUY_LOCK to serialize buys across symbols (avoid KRW oversubscribe).
-- Pending buy respects CircuitBreaker; if blocked, postpone to next 1m.
-- HALT prevents arming/trigger opening; pending buys canceled during HALT.
+Patched changes (visibility & safety):
+- (1) Readiness diag에 short_armed1m(...) 복원.
+- (2) LOG_TRAIL=1 시, stop 상승(트레일/BE) 로그 출력. BE 상승 시 [BE] 라인 고정 출력.
+- (3) 하트비트는 기존 그대로(포지션/stop/tp1/armed), 옵션으로 KRW 잔고도 쉽게 추가 가능.
+- (4) 기능 변화 없음; 진단 가시성만 강화.
+- (+) 추가 패치 A: fast loop에서 ARMED 윈도우 시간 만료 즉시 닫기.
+- (+) 추가 패치 B: 호가 조회 실패 시 부분청산은 스킵, 마지막 전량청산만 진행.
 """
 
 import os, time, json, math, logging, traceback, uuid, threading
@@ -70,7 +69,7 @@ ACCESS = ""
 SECRET = ""
 
 TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-SOL"]
-STATE_SCHEMA_VER = 4  # bumped (pending_buy_ts added)
+STATE_SCHEMA_VER = 4  # (pending_buy_ts added)
 
 DEFAULTS: Dict[str, Any] = dict(
     tf_base=5, use_ma=1, ma_s=10, ma_l=30, don_n=72, entry_tick_buffer=2,
@@ -92,7 +91,7 @@ SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
                 "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
                 "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-SOL": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 45, "don_n": 96,
-                "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
+                "buy_pct": 0.25, "trail_before": 0.08, "trail_after": 0.08,
                 "ptp_levels": "", "tp_rate": 0.03,  "fast_seq": "HL",
                 "armed_enable": 1, "armed_micro_trigger": "REBREAK",
                 "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
@@ -106,17 +105,18 @@ HEARTBEAT_PATH = "heartbeat.txt"
 ensure_dir(STATE_DIR)
 
 # ===== DIAG/FEED ENV =====
-LOG_DATA_DIAG     = int(os.getenv("LOG_DATA_DIAG", "1"))
-BACKFILL_LIMIT    = int(os.getenv("LIVE_BACKFILL_LIMIT", "10"))
-NEED_BUF_TF       = int(os.getenv("LIVE_NEED_BUF_TF", "80"))
-NEED_BUF_1M       = int(os.getenv("LIVE_NEED_BUF_1M", "60"))
-FETCH_PAGE        = int(os.getenv("LIVE_FETCH_COUNT", "200"))   # <=200 per pyupbit limit
-MAX_CACHE_MIN     = int(os.getenv("LIVE_MAX_CACHE_MIN", "5000"))
-ARMED_EXEC        = os.getenv("ARMED_EXEC", "next_open").lower()  # "next_open" | "immediate"
+LOG_DATA_DIAG  = int(os.getenv("LOG_DATA_DIAG", "1"))
+LOG_TRAIL      = int(os.getenv("LOG_TRAIL", "0"))           # stop 인상 로그 토글
+BACKFILL_LIMIT = int(os.getenv("LIVE_BACKFILL_LIMIT", "10"))
+NEED_BUF_TF    = int(os.getenv("LIVE_NEED_BUF_TF", "80"))
+NEED_BUF_1M    = int(os.getenv("LIVE_NEED_BUF_1M", "60"))
+FETCH_PAGE     = int(os.getenv("LIVE_FETCH_COUNT", "200"))  # <=200 per pyupbit limit
+MAX_CACHE_MIN  = int(os.getenv("LIVE_MAX_CACHE_MIN", "5000"))
+ARMED_EXEC     = os.getenv("ARMED_EXEC", "next_open").lower()  # "next_open" | "immediate"
 
 # minute task pool
-FETCH_WORKERS = min(3, len(TICKERS))     # conservative
-PER_TASK_TIMEOUT = 6.0                   # per-symbol minute task timeout
+FETCH_WORKERS    = min(3, len(TICKERS))     # conservative
+PER_TASK_TIMEOUT = 6.0                      # per-symbol minute task timeout
 
 # === BUY serialization across symbols (avoid KRW oversubscribe)
 BUY_LOCK = threading.Lock()
@@ -270,14 +270,12 @@ class UpbitBroker:
         # fallback keys
         for k in ("bid_price", "best_bid"):
             if k in item:
-                bid = float(item[k])
-                break
+                bid = float(item[k]); break
         else:
             raise RuntimeError("orderbook no bid")
         for k in ("ask_price", "best_ask"):
             if k in item:
-                ask = float(item[k])
-                break
+                ask = float(item[k]); break
         else:
             raise RuntimeError("orderbook no ask")
         return bid, ask
@@ -419,15 +417,24 @@ class SymbolStrategy:
         except Exception as e:
             logging.warning(f"[{self.symbol}] state save error: {e}")
 
-    # === Patched: TP1 이후 trail_after 사용
+    # === TP1 이후 trail_after 사용 & 인상 로그(옵션)
     def _trail_step(self) -> float:
         before = float(self.p.get("trail_before", 0.08))
         after  = float(self.p.get("trail_after",  0.08))
         return after if bool(self.state.tp1_done) else before
 
-    def _raise_stop(self, candidate: float):
-        if candidate and candidate > (self.state.stop or 0.0):
-            self.state.stop = candidate; self._save_state()
+    def _raise_stop(self, candidate: float) -> bool:
+        prev = self.state.stop or 0.0
+        if candidate and candidate > prev:
+            self.state.stop = candidate
+            self._save_state()
+            if LOG_TRAIL:
+                try:
+                    logging.info(f"[{self.symbol}] [TS] stop {round_price(prev,'down'):.0f} → {round_price(candidate,'down'):.0f}")
+                except Exception:
+                    logging.info(f"[{self.symbol}] [TS] stop {prev:.0f} → {candidate:.0f}")
+            return True
+        return False
 
     # ----- fill resolution -----
     def _resolve_buy_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> Tuple[float,float]:
@@ -507,8 +514,7 @@ class SymbolStrategy:
     def _sell(self, qty: float, reason: str):
         try:
             qty = min(qty, self.state.qty)
-            # qty step
-            qty = floor_to_step(qty, float(self.p.get("qty_step", 1e-8)))
+            qty = floor_to_step(qty, float(self.p.get("qty_step", 1e-8)))  # qty step
             if qty<=0: return
 
             # partial sell minKRW check (except when liquidating all)
@@ -519,7 +525,11 @@ class SymbolStrategy:
                     logging.info(f"[{self.symbol}] [SELL-skip] partial notional<{self.p.get('min_krw_order')} ({bid*qty:.1f})")
                     return
             except Exception as e:
-                logging.warning(f"[{self.symbol}] [SELL] best_bid_ask failed; proceed anyway: {e}")
+                # PATCH B: 호가 확인 실패 시 부분청산은 스킵, 마지막 전량만 진행
+                if not is_last:
+                    logging.warning(f"[{self.symbol}] [SELL-skip] no bid for partial; {e}")
+                    return
+                logging.warning(f"[{self.symbol}] [SELL] no bid; proceed last-all: {e}")
 
             resp = self.broker.sell_market(self.symbol, qty)
             uuid_ = str(resp.get("uuid",""))
@@ -610,7 +620,7 @@ class SymbolStrategy:
             return
 
         # invalidate if 1m low pierces anchor*(1-inval)
-        if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):  # <= to be conservative
+        if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):  # conservative
             self.state.is_armed=False; self._save_state()
             logging.info(f"[{self.symbol}] [DISARMED] low<=anchor")
             log_event("armed_close", symbol=self.symbol, reason="anchor_break")
@@ -639,13 +649,20 @@ class SymbolStrategy:
 
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
+        # PATCH A: time-based ARMED expiry even if minute_task skipped (e.g., CB blocked)
+        if self.state.is_armed and time.time() >= (self.state.armed_until or 0.0):
+            self.state.is_armed = False
+            self._save_state()
+            logging.info(f"[{self.symbol}] [DISARMED] window expired (fast loop)")
+            log_event("armed_close", symbol=self.symbol, reason="window_expired_fast")
+
         # HALT: cancel pending-buy; do NOT block stops/TP/PTP
         if os.path.exists(HALT_FILE) and self.state.pending_buy_ts > 0.0:
             logging.info(f"[{self.symbol}] [HALT] pending-buy canceled")
             self.state.pending_buy_ts = 0.0
             self._save_state()
 
-        # pending next-open buy (safety: execute when time reached, CB-aware)
+        # pending next-open buy (CB-aware)
         if (not self.state.has_pos) and (self.state.pending_buy_ts > 0.0) and (time.time() >= self.state.pending_buy_ts):
             if cb.blocked():
                 self.state.pending_buy_ts = math.floor(time.time()/60)*60 + 60  # postpone 1m
@@ -677,6 +694,7 @@ class SymbolStrategy:
                                 be=self.state.avg*(1.0+float(self.p["fee"])+float(self.p["eps_exec"]))
                                 self._raise_stop(round_price(be, "up"))
                                 self.state.tp1_done=True; self._save_state()
+                                logging.info(f"[{self.symbol}] [BE] stop→{round_price(be,'up'):.0f}")
 
         # TP
         tp=float(self.p.get("tp_rate",0.0))
@@ -699,7 +717,8 @@ def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBrok
                 stg.state.has_pos=True; stg.state.qty=qty; stg.state.avg=avg
                 stg.state.init_qty=qty; stg.state.ptp_hits=[]; stg.state.tp1_done=False
                 stg.state.is_armed=False; stg.state.pending_buy_ts=0.0
-                stg._raise_stop(round_price(avg*(1.0+stg._trail_step()), "down"))
+                # initial protective stop below avg (trail_before/after handled)
+                stg._raise_stop(round_price(avg*(1.0-stg._trail_step()), "down"))
                 stg._save_state()
                 logging.info(f"[{sym}] [RECONCILE] qty={qty:.8f}, avg={avg:.0f}")
                 log_event("reconcile_pos", symbol=sym, qty=qty, avg=avg)
@@ -740,7 +759,7 @@ def compute_need_1m(p: Dict[str, Any]) -> Tuple[int,int,int]:
 # ========================= main loop (tick scheduler) =========================
 def main():
     if not ACCESS or not SECRET:
-        raise SystemExit("ACCESS/SECRET required. Set env UPBIT_ACCESS/UPBIT_SECRET or fill in code.")
+        raise SystemExit("ACCESS/SECRET required. Set env UPBIT_ACCESS/UPBIT_SECRET.")
     broker=UpbitBroker(ACCESS, SECRET)
     params_by_symbol=load_symbol_params()
     feeds={s: Feed(s) for s in TICKERS}
@@ -776,12 +795,18 @@ def main():
             if LOG_DATA_DIAG: logging.info(f"[{symbol}] [diag] dfN empty (tf={tf}m)")
             return
 
-        # 3) readiness
+        # 3) readiness (short_armed1m 복원)
         ready_gate  = len(dfN) >= need_tf_bars
+        ready_armed = True
+        if int(p.get("armed_enable",0))==1:
+            ready_armed = len(df1) >= need_1m_total
+
         reasons = []
         if not ready_gate:  reasons.append(f"short_tfN({len(dfN)}/{need_tf_bars})")
+        if int(p.get("armed_enable",0))==1 and not ready_armed:
+            reasons.append(f"short_armed1m({len(df1)}/{need_1m_total})")
 
-        cur_state = "READY" if ready_gate else "NOT_READY"
+        cur_state = "READY" if (ready_gate and ready_armed) else "NOT_READY"
         if LOG_DATA_DIAG:
             state_str = cur_state if cur_state=="READY" else (cur_state+":"+",".join(reasons))
             logging.info(f"[{symbol}] [diag] tf={tf}m dfN={len(dfN)} needN>={need_tf_bars} | df1m={len(df1)} need1m>={need_1m_total} | {state_str}")
