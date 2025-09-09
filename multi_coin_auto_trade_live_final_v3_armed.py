@@ -9,7 +9,7 @@ LIVE trading bot for "MTF Gating + 1m Armed Entry".
 - Fast loop (intrabar manage) runs every second regardless of minute tasks.
 - Non-loosening stop invariant.
 - Startup reconcile from exchange as single source of truth.
-- Heartbeat guaranteed every HEARTBEAT_SEC.
+- Heartbeat guaranteed every HEARTBEAT_SEC, no drift.
 """
 
 import os, time, json, math, logging, traceback
@@ -136,7 +136,7 @@ def safe_call(fn, *args, tries: int = 3, delay: float = 0.5, backoff: float = 1.
 def strip_partial_1m(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
     idx: pd.DatetimeIndex = df.index
-    # 기준: KST 분 정각 미완성 캔들 제거
+    # 기준: KST 분 정각 미완성 캔들 제거 (tz-naive/aware 모두 안전 처리)
     if idx.tz is None:
         last_idx_kst_naive = idx[-1].to_pydatetime()
     else:
@@ -365,7 +365,7 @@ class SymbolStrategy:
                 self._enter_position(cb,"LEGACY")
             return
 
-        # ==== FIX #1: anchor = max(upper, prev_close) ====
+        # anchor = max(upper, prev_close)  (백테스터와 동일)
         if break_pass and ma_pass and not self.state.has_pos and not self.state.is_armed:
             window = int(self.p.get("armed_window_min", self.p["tf_base"]))
             now_ts = time.time()
@@ -392,7 +392,7 @@ class SymbolStrategy:
         if int(self.p.get("armed_reds",3))>0 and self.state.red_run_1m>=int(self.p["armed_reds"]):
             self.state.is_armed=False; self._save_state()
             logging.info(f"[{self.symbol}] [DISARMED] reds={self.p['armed_reds']}"); return
-        # ==== FIX #2: <= (경계 포함) ====
+        # 경계 포함해서 무효화 (<=)
         if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):
             self.state.is_armed=False; self._save_state()
             logging.info(f"[{self.symbol}] [DISARMED] low<=anchor"); return
@@ -485,9 +485,9 @@ def main():
     logging.info("[init] started v3 armed bot")
     reconcile_from_exchange(strats, broker)
 
-    # Minute scheduler
+    # ===== Absolute schedules (no drift) =====
     next_min_tick = math.floor(time.time()/60)*60 + 60
-    hb_t0 = time.time()
+    next_hb_tick  = math.floor(time.time()/HEARTBEAT_SEC)*HEARTBEAT_SEC + HEARTBEAT_SEC
 
     def minute_task(symbol: str):
         """Fetch 1m, resample N, gate & armed-trigger once per minute (per symbol)."""
@@ -527,7 +527,11 @@ def main():
                 spent = time.time()-start
                 if spent>5:
                     logging.info(f"[minute] tasks took {spent:.2f}s")
-                next_min_tick += 60  # schedule next minute
+                # catch-up: 만약 작업이 오래 걸려 경계가 여러 번 지났으면 즉시 따라잡기
+                now2 = time.time()
+                while next_min_tick <= now2 - 0.2:
+                    next_min_tick += 60
+                next_min_tick += 60  # 다음 분으로 예약
 
             # ===== fast loop: every second manage intrabar =====
             for s in TICKERS:
@@ -542,21 +546,24 @@ def main():
                     logging.error(f"[{s}] fast loop error: {e}")
                     logging.error(traceback.format_exc())
 
-            # ===== heartbeat: strict cadence =====
-            if time.time() - hb_t0 >= HEARTBEAT_SEC:
+            # ===== heartbeat: absolute schedule, no drift =====
+            now = time.time()
+            if now >= next_hb_tick:
                 lines=[]
                 for s, stg in strats.items():
                     st=stg.state
                     if st.has_pos:
                         lines.append(f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={st.stop:.0f} tp1={int(st.tp1_done)}")
                     elif st.is_armed:
-                        remain=int(max(0, st.armed_until - time.time()))
+                        remain=int(max(0, st.armed_until - now))
                         lines.append(f"{s}: ARMED({remain}s) anchor={round_to_tick(st.armed_anchor_price):.0f}")
                     else:
                         lines.append(f"{s}: idle")
                 logging.info("[hb] " + " | ".join(lines))
                 heartbeat_file()
-                hb_t0 = time.time()
+                # catch-up: 지연 중이면 경계 여러 개 건너뛴 만큼 보정
+                while next_hb_tick <= now:
+                    next_hb_tick += HEARTBEAT_SEC
 
             # ===== halting =====
             if halted():
