@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_coin_auto_trade_live_final_v3_armed.py  (final: robust backfill + prewarm + safety/visibility)
+multi_coin_auto_trade_live_final_v3_armed.py
+(final: robust backfill + prewarm + state-locking + inflight-guard + PTP-throttle)
 
 LIVE trading bot for "MTF Gating + 1m Armed Entry".
 - Backfilling 1m feed cache with multi-page pagination (<=200/req), robust gap/length diagnostics.
+- Boot prewarm to required minutes (optional, default ON).
 - Minute tasks (fetch 1m, resample N, gate, armed-trigger) run concurrently per symbol (non-blocking).
 - Fast loop (intrabar manage) runs every second regardless of minute tasks.
 - "Next 1m open" optional execution for ARMED trigger (backtest-timing compatible).
@@ -21,11 +23,18 @@ Backtest parity targets (align with backtest_breakout_partial_final_armed.py):
 - Optional execution at next 1m open on trigger (ARMED_EXEC=next_open).
 - Rounding via price_unit/round_price throughout.
 
-Patched changes (summary):
-- Backfill Fix: pagination cursor uses the fetched block's earliest time - 1s, with defensive jumps if overlap.
-- Prewarm: boot-time fetch to required length (LIVE_PREWARM=1 default).
-- Visibility: readiness diag includes short_armed1m(...); LOG_TRAIL=1 prints stop/BE bumps.
-- Safety: fast-loop ARMED expiry; partial-sell minKRW guard; buy serialization via mutex.
+Patch summary (this build):
+1) State race fix:
+   - Per-symbol RLock + "state 객체 교체 금지" (in-place reset).
+   - 모든 상태 쓰기 구간 잠금(파일저장 포함). 네트워크 호출은 가급적 락 밖.
+2) PTP 미달 반복/로그 스팸 방지:
+   - 수준별(deferred) 스로틀(기본 60s) + 미달 시 히트 미기록 유지(안전).
+   - 실제 체결 성공 시에만 ptp_hits/BE 적용.
+3) 체결 타임아웃 중복매수 방지(기회 재시도 유지):
+   - 매수 직전 잔고 스냅샷으로 선제 리컨실.
+   - 주문 uuid 보관(pending_buy_uuid) + 짧은 buy_guard_until (90s).
+   - 단, guard 중이라도 "거래소 잔고가 여전히 0"이면 재시도 허용.
+
 """
 
 import os, time, json, math, logging, traceback, uuid, threading
@@ -67,7 +76,7 @@ ACCESS = ""
 SECRET = ""
 
 TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-SOL"]
-STATE_SCHEMA_VER = 4  # (pending_buy_ts added)
+STATE_SCHEMA_VER = 5  # (+pending_buy_uuid, +buy_guard_until)
 
 DEFAULTS: Dict[str, Any] = dict(
     tf_base=5, use_ma=1, ma_s=10, ma_l=30, don_n=72, entry_tick_buffer=2,
@@ -112,6 +121,7 @@ FETCH_PAGE     = int(os.getenv("LIVE_FETCH_COUNT", "200"))  # <=200 per pyupbit 
 MAX_CACHE_MIN  = int(os.getenv("LIVE_MAX_CACHE_MIN", "5000"))
 ARMED_EXEC     = os.getenv("ARMED_EXEC", "next_open").lower()  # "next_open" | "immediate"
 PREWARM_AT_BOOT = int(os.getenv("LIVE_PREWARM", "1"))  # 부팅 시 필요 길이까지 즉시 백필
+PTP_DEFER_THROTTLE_SEC = int(os.getenv("PTP_DEFER_THROTTLE_SEC", "60"))
 
 # minute task pool
 FETCH_WORKERS    = min(3, len(TICKERS))     # conservative
@@ -432,6 +442,9 @@ class PositionState:
     armed_open_ts: float = 0.0
     # Pending (for next-open execution)
     pending_buy_ts: float = 0.0
+    # Inflight protection
+    pending_buy_uuid: str = ""
+    buy_guard_until: float = 0.0
 
     def to_json(self) -> dict:
         d = asdict(self); d["ptp_hits"] = self.ptp_hits or []; d["_ver"] = STATE_SCHEMA_VER; return d
@@ -447,6 +460,8 @@ class PositionState:
         st.armed_anchor_price = float(d.get("armed_anchor_price", 0.0))
         st.red_run_1m = int(d.get("red_run_1m", 0)); st.armed_open_ts = float(d.get("armed_open_ts", 0.0))
         st.pending_buy_ts = float(d.get("pending_buy_ts", 0.0))
+        st.pending_buy_uuid = str(d.get("pending_buy_uuid", ""))
+        st.buy_guard_until = float(d.get("buy_guard_until", 0.0))
         return st
 
 class SymbolStrategy:
@@ -457,7 +472,10 @@ class SymbolStrategy:
         self.state = self._load_state()
         self.ptp_levels = parse_ptp_levels(self.p.get("ptp_levels", ""))
         self.last_tf_idx: Optional[pd.Timestamp] = None
+        self._lock = threading.RLock()
+        self._ptp_deferred_ts: Dict[float, float] = {}  # level -> last log ts
 
+    # ---------- state helpers ----------
     def _load_state(self) -> PositionState:
         try:
             if os.path.exists(self.state_path):
@@ -468,33 +486,56 @@ class SymbolStrategy:
         return PositionState()
 
     def _save_state(self):
-        try:
-            with open(self.state_path,"w",encoding="utf-8") as f:
-                json.dump(self.state.to_json(), f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logging.warning(f"[{self.symbol}] state save error: {e}")
+        with self._lock:
+            try:
+                with open(self.state_path,"w",encoding="utf-8") as f:
+                    json.dump(self.state.to_json(), f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logging.warning(f"[{self.symbol}] state save error: {e}")
 
-    # === TP1 이후 trail_after 사용 & 인상 로그(옵션)
+    def reset_state_inplace(self):
+        with self._lock:
+            st = self.state
+            st.has_pos=False; st.qty=0.0; st.avg=0.0; st.stop=0.0; st.ts_anchor=0.0
+            st.ptp_hits=[]; st.tp1_done=False; st.init_qty=0.0
+            st.is_armed=False; st.armed_until=0.0; st.armed_anchor_price=0.0
+            st.red_run_1m=0; st.armed_open_ts=0.0
+            st.pending_buy_ts=0.0; st.pending_buy_uuid=""; st.buy_guard_until=0.0
+            self._save_state()
+
     def _trail_step(self) -> float:
-        before = float(self.p.get("trail_before", 0.08))
-        after  = float(self.p.get("trail_after",  0.08))
-        return after if bool(self.state.tp1_done) else before
+        with self._lock:
+            before = float(self.p.get("trail_before", 0.08))
+            after  = float(self.p.get("trail_after",  0.08))
+            return after if bool(self.state.tp1_done) else before
 
     def _raise_stop(self, candidate: float) -> bool:
-        prev = self.state.stop or 0.0
-        if candidate and candidate > prev:
-            self.state.stop = candidate
-            self._save_state()
-            if LOG_TRAIL:
-                try:
-                    logging.info(f"[{self.symbol}] [TS] stop {round_price(prev,'down'):.0f} → {round_price(candidate,'down'):.0f}")
-                except Exception:
-                    logging.info(f"[{self.symbol}] [TS] stop {prev:.0f} → {candidate:.0f}")
-            return True
-        return False
+        with self._lock:
+            prev = self.state.stop or 0.0
+            if candidate and candidate > prev:
+                self.state.stop = candidate
+                self._save_state()
+                if LOG_TRAIL:
+                    try:
+                        logging.info(f"[{self.symbol}] [TS] stop {round_price(prev,'down'):.0f} → {round_price(candidate,'down'):.0f}")
+                    except Exception:
+                        logging.info(f"[{self.symbol}] [TS] stop {prev:.0f} → {candidate:.0f}")
+                return True
+            return False
+
+    # ---------- exchange snapshot helpers ----------
+    def _exchange_position_snapshot(self) -> Tuple[float, float]:
+        """Return (qty, avg) for this symbol from exchange balances."""
+        bals = self.broker.get_balances() or []
+        by_ccy = {b.get("currency"): b for b in bals}
+        ccy = self.symbol.split("-")[1]
+        b = by_ccy.get(ccy) or {}
+        qty = float(b.get("balance") or 0.0)
+        avg = float(b.get("avg_buy_price") or 0.0)
+        return qty, avg
 
     # ----- fill resolution -----
-    def _resolve_buy_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> Tuple[float,float]:
+    def _resolve_buy_fill(self, uuid: str, timeout_s: float = 20.0, poll_s: float = 0.7) -> Tuple[float,float]:
         t0 = time.time(); last_state=""
         while time.time()-t0 < timeout_s:
             od = self.broker.get_order(uuid); last_state=str(od.get("state"))
@@ -511,7 +552,7 @@ class SymbolStrategy:
         log_event("resolve_timeout", side="buy", symbol=self.symbol, uuid=uuid, last_state=last_state)
         return 0.0,0.0
 
-    def _resolve_sell_fill(self, uuid: str, timeout_s: float = 8.0, poll_s: float = 0.6) -> float:
+    def _resolve_sell_fill(self, uuid: str, timeout_s: float = 12.0, poll_s: float = 0.6) -> float:
         t0 = time.time(); last_state=""
         while time.time()-t0 < timeout_s:
             od = self.broker.get_order(uuid); last_state=str(od.get("state"))
@@ -528,17 +569,31 @@ class SymbolStrategy:
     # ----- ENTER / EXIT -----
     def _enter_position(self, cb: CircuitBreaker, reason: str):
         try:
-            if self.state.has_pos:
-                return
-            # HALT: block new entries
+            # HALT / CB
             if os.path.exists(HALT_FILE):
                 logging.info(f"[{self.symbol}] [SKIP] HALT (entry blocked)")
-                log_event("skip_buy", symbol=self.symbol, reason="halt")
-                return
+                log_event("skip_buy", symbol=self.symbol, reason="halt"); return
             if cb.blocked():
                 logging.info(f"[{self.symbol}] [SKIP] CB blocked (entry)")
-                log_event("skip_buy", symbol=self.symbol, reason="cb_blocked")
-                return
+                log_event("skip_buy", symbol=self.symbol, reason="cb_blocked"); return
+
+            # pre-buy: reconcile & guard
+            exch_qty, exch_avg = self._exchange_position_snapshot()
+            with self._lock:
+                if self.state.has_pos or exch_qty > 1e-12:
+                    # sync if needed
+                    if exch_qty > 1e-12 and not self.state.has_pos:
+                        self.state.has_pos=True; self.state.qty=exch_qty; self.state.avg=exch_avg
+                        self.state.init_qty=exch_qty; self.state.ptp_hits=[]; self.state.tp1_done=False
+                        self.state.is_armed=False; self.state.pending_buy_ts=0.0
+                        self.state.pending_buy_uuid=""; self.state.buy_guard_until=0.0
+                        self._raise_stop(round_price(exch_avg*(1.0-self._trail_step()), "down"))
+                        self._save_state()
+                        logging.info(f"[{self.symbol}] [SYNC-before-buy] pos exists on exchange qty={exch_qty:.8f}@{exch_avg:.0f}")
+                    return
+                # guard: if within guard window BUT exchange says still flat -> allow
+                if (self.state.buy_guard_until or 0.0) > time.time():
+                    logging.info(f"[{self.symbol}] [guard] in window but flat on exchange → proceed")
 
             # serialize buys to avoid KRW oversubscribe
             with BUY_LOCK:
@@ -546,63 +601,86 @@ class SymbolStrategy:
                 amt = total_krw * float(self.p["buy_pct"])
                 if amt < float(self.p["min_krw_order"]):
                     logging.info(f"[{self.symbol}] [SKIP] low budget {amt:.0f}")
-                    log_event("skip_buy", symbol=self.symbol, reason="low_budget", krw=amt)
-                    return
+                    log_event("skip_buy", symbol=self.symbol, reason="low_budget", krw=amt); return
                 resp = self.broker.buy_market_krw(self.symbol, amt)
                 uuid_ = str(resp.get("uuid",""))
                 log_event("order_submitted", side="buy", symbol=self.symbol, uuid=uuid_, krw=amt, reason=reason)
                 if not uuid_:
                     cb.fail("buy-uuid"); logging.error(f"[{self.symbol}] BUY no uuid"); return
 
+            # set inflight guard
+            with self._lock:
+                self.state.pending_buy_uuid = uuid_
+                self.state.buy_guard_until = time.time() + 90.0
+                self._save_state()
+
             qty, avg = self._resolve_buy_fill(uuid_)
             if qty<=0 or avg<=0:
-                cb.fail("buy-nofill"); logging.error(f"[{self.symbol}] BUY no fill"); return
-            self.state.has_pos=True; self.state.qty=qty; self.state.avg=avg
-            self.state.init_qty=qty; self.state.ptp_hits=[]; self.state.tp1_done=False
-            self.state.ts_anchor=avg
-            self.state.pending_buy_ts=0.0
-            self._raise_stop(round_price(avg*(1.0-self._trail_step()), "down"))
-            self.state.is_armed=False; self._save_state(); cb.ok()
+                cb.fail("buy-nofill"); logging.error(f"[{self.symbol}] BUY no fill (timeout or rejected)")
+                # leave guard; minute/next attempt will pre-check exchange again
+                return
+
+            with self._lock:
+                self.state.has_pos=True; self.state.qty=qty; self.state.avg=avg
+                self.state.init_qty=qty; self.state.ptp_hits=[]; self.state.tp1_done=False
+                self.state.ts_anchor=avg
+                self.state.pending_buy_ts=0.0
+                self.state.pending_buy_uuid=""; self.state.buy_guard_until=0.0
+                self._raise_stop(round_price(avg*(1.0-self._trail_step()), "down"))
+                self.state.is_armed=False; self._save_state()
+            cb.ok()
             logging.info(f"[{self.symbol}] [BUY-{reason}] {qty:.8f} @ {round_price(avg,'down'):.0f}")
             log_event("trade_filled", side="buy", symbol=self.symbol, uuid=uuid_, qty=qty, avg=avg, reason=reason)
         except Exception as e:
             cb.fail("buy-exc"); logging.error(f"[{self.symbol}] BUY error: {e}"); logging.error(traceback.format_exc())
 
-    def _sell(self, qty: float, reason: str):
+    def _sell(self, qty: float, reason: str) -> float:
+        """Place market sell; return filled quantity (0.0 if none)."""
         try:
-            qty = min(qty, self.state.qty)
-            qty = floor_to_step(qty, float(self.p.get("qty_step", 1e-8)))  # qty step
-            if qty<=0: return
+            # Snapshot under lock
+            with self._lock:
+                qty = min(qty, self.state.qty)
+                step = float(self.p.get("qty_step", 1e-8))
+                qty = floor_to_step(qty, step)
+                if qty<=0: return 0.0
+                cur_qty = self.state.qty
 
             # partial sell minKRW check (except when liquidating all)
-            is_last = abs(qty - self.state.qty) <= 1e-12
+            is_last = abs(qty - cur_qty) <= 1e-12
             try:
                 bid, _ = self.broker.best_bid_ask(self.symbol)
                 if (not is_last) and (bid * qty) < float(self.p.get("min_krw_order", 6000.0)):
                     logging.info(f"[{self.symbol}] [SELL-skip] partial notional<{self.p.get('min_krw_order')} ({bid*qty:.1f})")
-                    return
+                    return 0.0
             except Exception as e:
                 # Only allow last-all when bid lookup fails
                 if not is_last:
                     logging.warning(f"[{self.symbol}] [SELL-skip] no bid for partial; {e}")
-                    return
+                    return 0.0
                 logging.warning(f"[{self.symbol}] [SELL] no bid; proceed last-all: {e}")
 
             resp = self.broker.sell_market(self.symbol, qty)
             uuid_ = str(resp.get("uuid",""))
             log_event("order_submitted", side="sell", symbol=self.symbol, uuid=uuid_, qty=qty, reason=reason)
             if not uuid_:
-                logging.error(f"[{self.symbol}] SELL no uuid"); return
+                logging.error(f"[{self.symbol}] SELL no uuid"); return 0.0
             filled = self._resolve_sell_fill(uuid_)
-            if filled<=0: logging.error(f"[{self.symbol}] SELL no fill"); return
-            self.state.qty -= filled
-            if self.state.qty <= 1e-12:
-                self.state = PositionState()  # flat reset
-            self._save_state()
+            if filled<=0:
+                logging.error(f"[{self.symbol}] SELL no fill"); return 0.0
+
+            with self._lock:
+                self.state.qty -= filled
+                if self.state.qty <= 1e-12:
+                    # in-place reset (no object swap)
+                    self.reset_state_inplace()
+                else:
+                    self._save_state()
             logging.info(f"[{self.symbol}] [SELL-{reason}] qty={filled:.8f}")
             log_event("trade_filled", side="sell", symbol=self.symbol, uuid=uuid_, qty=filled, reason=reason, stop=self.state.stop)
+            return filled
         except Exception as e:
             logging.error(f"[{self.symbol}] SELL error: {e}"); logging.error(traceback.format_exc())
+            return 0.0
 
     # ----- GATE (N-min close) -----
     def on_bar_close_tf(self, dfN: pd.DataFrame, cb: CircuitBreaker):
@@ -632,22 +710,27 @@ class SymbolStrategy:
         break_pass = prev_close > up_buf
 
         if int(self.p.get("armed_enable",0))==0:
-            if not self.state.has_pos and break_pass and ma_pass and not cb.blocked():
+            with self._lock:
+                can_buy = not self.state.has_pos
+            if can_buy and break_pass and ma_pass and not cb.blocked():
                 logging.info(f"[{self.symbol}] [LEGACY-ENTER] pass → BUY")
                 self._enter_position(cb,"LEGACY")
             return
 
         # Armed window open (anchor per backtest: max(upper, prev_close))
-        if break_pass and ma_pass and not self.state.has_pos and not self.state.is_armed:
+        with self._lock:
+            can_arm = break_pass and ma_pass and (not self.state.has_pos) and (not self.state.is_armed)
+        if can_arm:
             window = int(self.p.get("armed_window_min", self.p["tf_base"]))
             now_ts = time.time()
             anchor = max(upper, prev_close)
-            self.state.is_armed=True
-            self.state.armed_until=now_ts+window*60
-            self.state.armed_anchor_price=anchor
-            self.state.red_run_1m=0
-            self.state.armed_open_ts=now_ts
-            self._save_state()
+            with self._lock:
+                self.state.is_armed=True
+                self.state.armed_until=now_ts+window*60
+                self.state.armed_anchor_price=anchor
+                self.state.red_run_1m=0
+                self.state.armed_open_ts=now_ts
+                self._save_state()
             logging.info(f"[{self.symbol}] [ARMED] {window}m anchor={round_price(anchor,'down'):.0f}")
             log_event("armed_open", symbol=self.symbol, window=window, anchor=anchor)
 
@@ -656,32 +739,38 @@ class SymbolStrategy:
         # HALT: ignore triggers
         if os.path.exists(HALT_FILE):
             return
-        if not self.state.is_armed: return
-        now_t = time.time()
-        if now_t >= self.state.armed_until:
-            self.state.is_armed=False; self._save_state()
-            logging.info(f"[{self.symbol}] [DISARMED] window expired")
-            log_event("armed_close", symbol=self.symbol, reason="window_expired")
-            return
+        with self._lock:
+            if not self.state.is_armed:
+                return
+            now_t = time.time()
+            if now_t >= self.state.armed_until:
+                self.state.is_armed=False; self._save_state()
+                logging.info(f"[{self.symbol}] [DISARMED] window expired")
+                log_event("armed_close", symbol=self.symbol, reason="window_expired")
+                return
+
         need_len = max(int(self.p["armed_ma_l_1m"])+1, int(self.p["armed_rebreak_lookback"])+3)
         if df1m is None or len(df1m) < (need_len+1): return
         last_closed_ts = df1m.index[-1].to_pydatetime().timestamp()
-        if last_closed_ts <= (self.state.armed_open_ts or 0.0): return
+        with self._lock:
+            opened_ts = self.state.armed_open_ts or 0.0
+        if last_closed_ts <= opened_ts: return
 
         prev1m, cur1m = df1m.iloc[-2], df1m.iloc[-1]
-        self.state.red_run_1m = self.state.red_run_1m + 1 if cur1m["close"]<prev1m["close"] else 0
-        if int(self.p.get("armed_reds",3))>0 and self.state.red_run_1m>=int(self.p["armed_reds"]):
-            self.state.is_armed=False; self._save_state()
-            logging.info(f"[{self.symbol}] [DISARMED] reds={self.p['armed_reds']}")
-            log_event("armed_close", symbol=self.symbol, reason="reds")
-            return
+        with self._lock:
+            self.state.red_run_1m = self.state.red_run_1m + 1 if cur1m["close"]<prev1m["close"] else 0
+            if int(self.p.get("armed_reds",3))>0 and self.state.red_run_1m>=int(self.p["armed_reds"]):
+                self.state.is_armed=False; self._save_state()
+                logging.info(f"[{self.symbol}] [DISARMED] reds={self.p['armed_reds']}")
+                log_event("armed_close", symbol=self.symbol, reason="reds")
+                return
 
-        # invalidate if 1m low pierces anchor*(1-inval)
-        if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):  # conservative
-            self.state.is_armed=False; self._save_state()
-            logging.info(f"[{self.symbol}] [DISARMED] low<=anchor")
-            log_event("armed_close", symbol=self.symbol, reason="anchor_break")
-            return
+            # invalidate if 1m low pierces anchor*(1-inval)
+            if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):
+                self.state.is_armed=False; self._save_state()
+                logging.info(f"[{self.symbol}] [DISARMED] low<=anchor")
+                log_event("armed_close", symbol=self.symbol, reason="anchor_break")
+                return
 
         trig=str(self.p.get("armed_micro_trigger","MA")).upper(); trigger_ok=False
         if trig=="MA":
@@ -692,10 +781,13 @@ class SymbolStrategy:
             k=int(self.p["armed_rebreak_lookback"]); recent_high=float(df1m["high"].iloc[-k-1:-1].max())
             if float(cur1m["close"])>recent_high: trigger_ok=True
 
-        if trigger_ok and not cb.blocked() and not self.state.has_pos:
+        with self._lock:
+            can_buy = trigger_ok and (not cb.blocked()) and (not self.state.has_pos)
+        if can_buy:
             if ARMED_EXEC == "next_open":
-                self.state.pending_buy_ts = math.floor(time.time()/60)*60 + 60
-                self._save_state()
+                with self._lock:
+                    self.state.pending_buy_ts = math.floor(time.time()/60)*60 + 60
+                    self._save_state()
                 logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY_PENDING(NEXT_OPEN)")
                 log_event("armed_trigger", symbol=self.symbol, trigger=trig, exec="next_open",
                           pending_ts=self.state.pending_buy_ts)
@@ -706,62 +798,120 @@ class SymbolStrategy:
 
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
-        # fast-loop ARMED expiry (in case minute task missed)
-        if self.state.is_armed and time.time() >= (self.state.armed_until or 0.0):
-            self.state.is_armed = False
-            self._save_state()
-            logging.info(f"[{self.symbol}] [DISARMED] window expired (fast loop)")
-            log_event("armed_close", symbol=self.symbol, reason="window_expired_fast")
-
-        # HALT: cancel pending-buy; do NOT block stops/TP/PTP
-        if os.path.exists(HALT_FILE) and self.state.pending_buy_ts > 0.0:
-            logging.info(f"[{self.symbol}] [HALT] pending-buy canceled")
-            self.state.pending_buy_ts = 0.0
-            self._save_state()
-
-        # pending next-open buy (CB-aware)
-        if (not self.state.has_pos) and (self.state.pending_buy_ts > 0.0) and (time.time() >= self.state.pending_buy_ts):
-            if cb.blocked():
-                self.state.pending_buy_ts = math.floor(time.time()/60)*60 + 60  # postpone 1m
+        now = time.time()
+        # fast-loop ARMED expiry
+        with self._lock:
+            if self.state.is_armed and now >= (self.state.armed_until or 0.0):
+                self.state.is_armed = False
                 self._save_state()
-            else:
-                self._enter_position(cb, "ARMED-NEXTOPEN")
+                logging.info(f"[{self.symbol}] [DISARMED] window expired (fast loop)")
+                log_event("armed_close", symbol=self.symbol, reason="window_expired_fast")
+
+            # HALT: cancel pending-buy; do NOT block stops/TP/PTP
+            if os.path.exists(HALT_FILE) and self.state.pending_buy_ts > 0.0:
+                logging.info(f"[{self.symbol}] [HALT] pending-buy canceled")
                 self.state.pending_buy_ts = 0.0
                 self._save_state()
 
-        if not self.state.has_pos: return
+            # pending next-open buy (CB-aware)
+            if (not self.state.has_pos) and (self.state.pending_buy_ts > 0.0) and (now >= self.state.pending_buy_ts):
+                if cb.blocked():
+                    self.state.pending_buy_ts = math.floor(now/60)*60 + 60  # postpone 1m
+                    self._save_state()
+                else:
+                    # double-check exchange before placing
+                    pass_to_buy = True
+                    exch_qty, exch_avg = self._exchange_position_snapshot()
+                    if exch_qty > 1e-12:
+                        # already filled elsewhere
+                        self.state.has_pos=True; self.state.qty=exch_qty; self.state.avg=exch_avg
+                        self.state.init_qty=exch_qty; self.state.ptp_hits=[]; self.state.tp1_done=False
+                        self.state.pending_buy_ts = 0.0
+                        self.state.is_armed=False
+                        self.state.pending_buy_uuid=""; self.state.buy_guard_until=0.0
+                        self._raise_stop(round_price(exch_avg*(1.0-self._trail_step()), "down"))
+                        self._save_state()
+                        pass_to_buy = False
+                    if pass_to_buy:
+                        # release lock to avoid nesting during _enter_position
+                        pass
+                # end with; fall-through
+
+        # If we decided to buy now (pending window hit and not blocked), call enter outside lock
+        with self._lock:
+            should_enter = (not self.state.has_pos) and (self.state.pending_buy_ts > 0.0) and (now >= self.state.pending_buy_ts) and (not cb.blocked())
+        if should_enter:
+            self._enter_position(cb, "ARMED-NEXTOPEN")
+            with self._lock:
+                self.state.pending_buy_ts = 0.0
+                self._save_state()
+
+        # If flat, nothing more to manage
+        with self._lock:
+            has_pos = self.state.has_pos
+        if not has_pos:
+            return
+
+        # trailing stop (uses current price)
         trail=self._trail_step(); high_now=max(bid,ask)
         self._raise_stop(round_price(high_now*(1.0-trail), "down"))
 
-        # PTP + BE bump
+        # PTP + BE bump (with deferred throttle on notional<minKRW)
         if self.ptp_levels:
             for (lv, fr) in self.ptp_levels:
-                if lv in (self.state.ptp_hits or []): continue
-                tgt=round_price(self.state.avg*(1.0+lv), "down")
-                if high_now>=tgt and self.state.qty>0:
-                    sell_qty = floor_to_step(min(self.state.init_qty*float(fr), self.state.qty), float(self.p.get("qty_step", 1e-8)))
-                    if sell_qty > 0:
-                        is_last = abs(sell_qty - self.state.qty) <= 1e-12
-                        if (not is_last) and (bid * sell_qty) < float(self.p.get("min_krw_order", 6000.0)):
-                            logging.info(f"[{self.symbol}] [PTP-skip] partial notional<{self.p.get('min_krw_order')} (lv={lv}, fr={fr})")
-                        else:
-                            self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
+                with self._lock:
+                    already = (lv in (self.state.ptp_hits or []))
+                    qty_now = self.state.qty
+                    init_qty = self.state.init_qty
+                    avg_px = self.state.avg
+                if already or qty_now<=0:
+                    continue
+                tgt=round_price(avg_px*(1.0+lv), "down")
+                if high_now>=tgt:
+                    step = float(self.p.get("qty_step", 1e-8))
+                    sell_qty = floor_to_step(min(init_qty*float(fr), qty_now), step)
+                    if sell_qty <= 0:
+                        continue
+                    # pre-check notional for throttle
+                    is_last = abs(sell_qty - qty_now) <= 1e-12
+                    if not is_last:
+                        try:
+                            if bid * sell_qty < float(self.p.get("min_krw_order", 6000.0)):
+                                last_log = self._ptp_deferred_ts.get(lv, 0.0)
+                                if (time.time() - last_log) >= PTP_DEFER_THROTTLE_SEC:
+                                    logging.info(f"[{self.symbol}] [PTP-defer] lv={lv:.3f} qty={sell_qty:.8f} notional<{self.p.get('min_krw_order')}")
+                                    self._ptp_deferred_ts[lv] = time.time()
+                                continue
+                        except Exception as e:
+                            # if bid check fails, fall back to _sell's own check
+                            pass
+
+                    filled = self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
+                    if filled > 0.0:
+                        with self._lock:
                             (self.state.ptp_hits or []).append(lv)
                             if int(self.p.get("ptp_be",0))==1:
-                                be=self.state.avg*(1.0+float(self.p["fee"])+float(self.p["eps_exec"]))
+                                be=avg_px*(1.0+float(self.p["fee"])+float(self.p["eps_exec"]))
                                 self._raise_stop(round_price(be, "up"))
-                                self.state.tp1_done=True; self._save_state()
+                                self.state.tp1_done=True
+                                self._save_state()
                                 logging.info(f"[{self.symbol}] [BE] stop→{round_price(be,'up'):.0f}")
 
         # TP
         tp=float(self.p.get("tp_rate",0.0))
-        if tp>0 and self.state.qty>0:
-            tp_px=round_price(self.state.avg*(1.0+tp), "down")
-            if high_now>=tp_px: self._sell(self.state.qty,"TP"); return
+        if tp>0:
+            with self._lock:
+                qty_now = self.state.qty; avg_px = self.state.avg
+            if qty_now>0:
+                tp_px=round_price(avg_px*(1.0+tp), "down")
+                if high_now>=tp_px:
+                    self._sell(qty_now,"TP"); return
 
         # TS
-        if self.state.stop and bid<=self.state.stop and self.state.qty>0:
-            self._sell(self.state.qty,"TS")
+        with self._lock:
+            st_stop = self.state.stop; qty_now = self.state.qty
+        if st_stop and bid<=st_stop and qty_now>0:
+            self._sell(qty_now,"TS")
 
 # ========================= reconcile =========================
 def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBroker):
@@ -771,18 +921,21 @@ def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBrok
             ccy=sym.split("-")[1]; b=by_ccy.get(ccy)
             qty=float((b or {}).get("balance") or 0.0); avg=float((b or {}).get("avg_buy_price") or 0.0)
             if qty>1e-12:
-                stg.state.has_pos=True; stg.state.qty=qty; stg.state.avg=avg
-                stg.state.init_qty=qty; stg.state.ptp_hits=[]; stg.state.tp1_done=False
-                stg.state.is_armed=False; stg.state.pending_buy_ts=0.0
-                stg._raise_stop(round_price(avg*(1.0-stg._trail_step()), "down"))
-                stg._save_state()
+                with stg._lock:
+                    stg.state.has_pos=True; stg.state.qty=qty; stg.state.avg=avg
+                    stg.state.init_qty=qty; stg.state.ptp_hits=[]; stg.state.tp1_done=False
+                    stg.state.is_armed=False; stg.state.pending_buy_ts=0.0
+                    stg.state.pending_buy_uuid=""; stg.state.buy_guard_until=0.0
+                    stg._raise_stop(round_price(avg*(1.0-stg._trail_step()), "down"))
+                    stg._save_state()
                 logging.info(f"[{sym}] [RECONCILE] qty={qty:.8f}, avg={avg:.0f}")
                 log_event("reconcile_pos", symbol=sym, qty=qty, avg=avg)
             else:
-                if stg.state.has_pos or stg.state.qty>0:
-                    stg.state=PositionState(); stg._save_state()
-                    logging.info(f"[{sym}] [RECONCILE] cleared local state")
-                    log_event("reconcile_clear", symbol=sym)
+                with stg._lock:
+                    if stg.state.has_pos or stg.state.qty>0:
+                        stg.reset_state_inplace()
+                        logging.info(f"[{sym}] [RECONCILE] cleared local state")
+                        log_event("reconcile_clear", symbol=sym)
     except Exception as e:
         logging.error(f"[reconcile] {e}"); logging.error(traceback.format_exc())
 
@@ -894,7 +1047,8 @@ def main():
             strats[symbol].last_tf_idx = cur_idx
             CB[symbol].ok()
 
-        if strats[symbol].state.is_armed:
+        if True:
+            # trigger check only if ARMED
             strats[symbol].check_armed_trigger_1m(df1, CB[symbol])
 
     # ---- minute task executor (non-blocking) ----
@@ -911,7 +1065,6 @@ def main():
                     # housekeeping old futures (timeout/exception)
                     for s, pack in list(pending.items()):
                         fut, t0 = pack
-                        # timeout handling (non-blocking check)
                         if not fut.done() and (now - t0) > PER_TASK_TIMEOUT:
                             CB[s].fail("minute-timeout")
                         if fut.done():
@@ -926,7 +1079,6 @@ def main():
 
                     # submit new tasks for all symbols
                     for s in TICKERS:
-                        # if previous still running, skip resubmit this minute (prevent pile-up)
                         if s in pending and not pending[s][0].done():
                             continue
                         pending[s] = (minute_pool.submit(minute_task, s), now)
@@ -941,7 +1093,6 @@ def main():
                     try:
                         if CB[s].blocked(): continue
                         bid, ask = broker.best_bid_ask(s)
-                        # manage pending buy and trailing/ptp/ts
                         strats[s].manage_intrabar(bid, ask, CB[s])
                         CB[s].ok()
                     except Exception as e:
@@ -954,14 +1105,15 @@ def main():
                 if now >= next_hb_tick:
                     lines=[]
                     for s, stg in strats.items():
-                        st=stg.state
-                        if st.has_pos:
-                            lines.append(f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={round_price(st.stop,'down'):.0f} tp1={int(st.tp1_done)}")
-                        elif st.is_armed:
-                            remain=int(max(0, st.armed_until - now))
-                            lines.append(f"{s}: ARMED({remain}s) anchor={round_price(st.armed_anchor_price,'down'):.0f}")
-                        else:
-                            lines.append(f"{s}: idle")
+                        with stg._lock:
+                            st=stg.state
+                            if st.has_pos:
+                                lines.append(f"{s}: pos={st.qty:.6f}@{st.avg:.0f} stop={round_price(st.stop,'down'):.0f} tp1={int(st.tp1_done)}")
+                            elif st.is_armed:
+                                remain=int(max(0, st.armed_until - now))
+                                lines.append(f"{s}: ARMED({remain}s) anchor={round_price(st.armed_anchor_price,'down'):.0f}")
+                            else:
+                                lines.append(f"{s}: idle")
                     logging.info("[hb] " + " | ".join(lines))
                     heartbeat_file()
                     while next_hb_tick <= now:
@@ -969,7 +1121,6 @@ def main():
 
                 # ===== halting =====
                 if os.path.exists(HALT_FILE):
-                    # do not block loop; entry/arming is handled inside strategy methods
                     pass
 
                 time.sleep(POLL_SEC)
