@@ -83,7 +83,7 @@ SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
                 "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
                 "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-SOL": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 45, "don_n": 96,
-                "buy_pct": 0.25, "trail_before": 0.08, "trail_after": 0.08,
+                "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
                 "ptp_levels": "", "tp_rate": 0.03,  "fast_seq": "HL",
                 "armed_enable": 1, "armed_micro_trigger": "REBREAK",
                 "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
@@ -155,7 +155,8 @@ def parse_ptp_levels(spec: str) -> List[Tuple[float, float]]:
     out: List[Tuple[float, float]] = []
     for part in (spec or "").split(","):
         part = part.strip()
-        if not part: continue
+        if not part:
+            continue
         lv, pct = part.split(":")
         out.append((float(lv), float(pct)))
     out.sort(key=lambda x: x[0])
@@ -219,27 +220,6 @@ class CircuitBreaker:
             logging.error(f"[CB] BLOCKED {self.cool_sec}s")
             log_event("cb_blocked", cool_sec=self.cool_sec)
 
-class UpbitBroker:
-    def __init__(self, access: str, secret: str):
-        self.up = pyupbit.Upbit(access, secret)
-    def krw_balance(self) -> float:
-        bal = safe_call(self.up.get_balance, "KRW"); return float(bal or 0.0)
-    def best_bid_ask(self, ticker: str) -> Tuple[float, float]:
-        ob = safe_call(pyupbit.get_orderbook, ticker)
-        units = (ob[0] or {}).get("orderbook_units", []) if isinstance(ob, list) and ob else (ob or {}).get("orderbook_units", [])
-        if not units: raise RuntimeError("orderbook empty")
-        u0 = units[0]; bid = float(u0.get("bid_price", 0.0)); ask = float(u0.get("ask_price", 0.0))
-        if bid <= 0 or ask <= 0: raise RuntimeError("invalid bid/ask")
-        return bid, ask
-    def buy_market_krw(self, ticker: str, krw: float) -> dict:
-        return safe_call(self.up.buy_market_order, ticker, krw)
-    def sell_market(self, ticker: str, qty: float) -> dict:
-        return safe_call(self.up.sell_market_order, ticker, qty)
-    def get_order(self, uuid: str) -> dict:
-        return safe_call(self.up.get_order, uuid)
-    def get_balances(self):
-        return safe_call(self.up.get_balances)
-
 def safe_call(fn, *args, tries: int = 3, delay: float = 0.5, backoff: float = 1.7, **kwargs):
     t = delay
     for i in range(tries):
@@ -252,6 +232,62 @@ def safe_call(fn, *args, tries: int = 3, delay: float = 0.5, backoff: float = 1.
             logging.warning(f"[safe_call] {fn.__name__} error: {e}. retry in {t:.1f}s")
             time.sleep(t); t *= backoff
 
+class UpbitBroker:
+    def __init__(self, access: str, secret: str):
+        self.up = pyupbit.Upbit(access, secret)
+
+    # robust orderbook normalizer (handles list/dict variants)
+    def _normalize_orderbook(self, resp: Any) -> Tuple[float, float]:
+        if resp is None:
+            raise RuntimeError("orderbook None")
+        item = None
+        if isinstance(resp, list):
+            item = resp[0] if resp else None
+        elif isinstance(resp, dict):
+            item = resp
+        else:
+            raise RuntimeError(f"orderbook unexpected type: {type(resp)}")
+        if not item:
+            raise RuntimeError("orderbook empty item")
+        if "orderbook_units" in item:
+            units = item["orderbook_units"] or []
+            if not units:
+                raise RuntimeError("orderbook units empty")
+            bid = float(units[0]["bid_price"])
+            ask = float(units[0]["ask_price"])
+            return bid, ask
+        # fallback keys
+        for k in ("bid_price", "best_bid"):
+            if k in item:
+                bid = float(item[k])
+                break
+        else:
+            raise RuntimeError("orderbook no bid")
+        for k in ("ask_price", "best_ask"):
+            if k in item:
+                ask = float(item[k])
+                break
+        else:
+            raise RuntimeError("orderbook no ask")
+        return bid, ask
+
+    def krw_balance(self) -> float:
+        bal = safe_call(self.up.get_balance, "KRW"); return float(bal or 0.0)
+    def best_bid_ask(self, ticker: str) -> Tuple[float, float]:
+        ob = safe_call(pyupbit.get_orderbook, ticker)
+        bid, ask = self._normalize_orderbook(ob)
+        if bid <= 0 or ask <= 0:
+            raise RuntimeError("invalid bid/ask")
+        return bid, ask
+    def buy_market_krw(self, ticker: str, krw: float) -> dict:
+        return safe_call(self.up.buy_market_order, ticker, krw)
+    def sell_market(self, ticker: str, qty: float) -> dict:
+        return safe_call(self.up.sell_market_order, ticker, qty)
+    def get_order(self, uuid: str) -> dict:
+        return safe_call(self.up.get_order, uuid)
+    def get_balances(self):
+        return safe_call(self.up.get_balances)
+
 # -------- Backfilling Feed (1m cache + diagnostics) --------
 class Feed:
     def __init__(self, ticker: str):
@@ -262,7 +298,8 @@ class Feed:
         kw = {"interval": "minute1", "count": min(int(count), 200)}
         if to_ts is not None:
             kw["to"] = to_ts.strftime("%Y-%m-%d %H:%M:%S")  # KST naive acceptable for pyupbit
-        df = safe_call(pyupbit.get_ohlcv, self.ticker, **kw) or pd.DataFrame()
+        tmp = safe_call(pyupbit.get_ohlcv, self.ticker, **kw)
+        df = tmp if isinstance(tmp, pd.DataFrame) else pd.DataFrame()
         if df.empty: return df
         df = strip_partial_1m(df).sort_index()
         df = df[~df.index.duplicated(keep="last")]
@@ -508,7 +545,8 @@ class SymbolStrategy:
             logging.info(f"[{self.symbol}] [DISARMED] window expired")
             log_event("armed_close", symbol=self.symbol, reason="window_expired")
             return
-        if df1m is None or len(df1m)<max(int(self.p["armed_ma_l_1m"])+1,int(self.p["armed_rebreak_lookback"])+3): return
+        need_len = max(int(self.p["armed_ma_l_1m"])+1, int(self.p["armed_rebreak_lookback"])+3)
+        if df1m is None or len(df1m) < (need_len+1): return
         last_closed_ts = df1m.index[-1].to_pydatetime().timestamp()
         if last_closed_ts <= (self.state.armed_open_ts or 0.0): return
 
@@ -549,10 +587,10 @@ class SymbolStrategy:
                 self._enter_position(cb,f"ARMED-{trig}")
 
     # ----- intrabar manage (1s) -----
-    def manage_intrabar(self, bid: float, ask: float):
+    def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
         # pending next-open buy (safety: execute when time reached)
         if (not self.state.has_pos) and (self.state.pending_buy_ts > 0.0) and (time.time() >= self.state.pending_buy_ts):
-            self._enter_position(CircuitBreaker(), "ARMED-NEXTOPEN")
+            self._enter_position(cb, "ARMED-NEXTOPEN")
             self.state.pending_buy_ts = 0.0
             self._save_state()
 
@@ -675,11 +713,11 @@ def main():
 
         # 3) readiness
         ready_gate  = len(dfN) >= need_tf_bars
-        ready_armed = len(df1) >= need_1m_for_armed + NEED_BUF_1M
+        ready_armed = len(df1) >= need_1m_total  # parity-aligned
         reasons = []
         if not ready_gate:  reasons.append(f"short_tfN({len(dfN)}/{need_tf_bars})")
         if int(p.get("armed_enable",0))==1 and not ready_armed:
-            reasons.append(f"short_armed1m({len(df1)}/{need_1m_for_armed+NEED_BUF_1M})")
+            reasons.append(f"short_armed1m({len(df1)}/{need_1m_total})")
 
         cur_state = "READY" if (ready_gate and (int(p.get("armed_enable",0))==0 or ready_armed)) else "NOT_READY"
         if LOG_DATA_DIAG:
@@ -712,16 +750,22 @@ def main():
                 start = time.time()
                 with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(TICKERS))) as ex:
                     futs = {ex.submit(minute_task, s): s for s in TICKERS}
-                    for fut in as_completed(futs, timeout=MINUTE_TASK_DEADLINE):
-                        sym = futs[fut]
-                        try:
-                            fut.result(timeout=PER_TASK_TIMEOUT)
-                        except TimeoutError:
-                            CB[sym].fail("minute-timeout")
-                        except Exception as e:
-                            CB[sym].fail("minute-exc")
-                            logging.error(f"[{sym}] minute task error: {e}")
-                            logging.error(traceback.format_exc())
+                    try:
+                        for fut in as_completed(futs, timeout=MINUTE_TASK_DEADLINE):
+                            sym = futs[fut]
+                            try:
+                                fut.result(timeout=PER_TASK_TIMEOUT)
+                            except TimeoutError:
+                                CB[sym].fail("minute-timeout")
+                            except Exception as e:
+                                CB[sym].fail("minute-exc")
+                                logging.error(f"[{sym}] minute task error: {e}")
+                                logging.error(traceback.format_exc())
+                    except TimeoutError:
+                        # outer timeout: mark unfinished ones
+                        for fut, sym in futs.items():
+                            if not fut.done():
+                                CB[sym].fail("minute-timeout-outer")
                 spent = time.time()-start
                 if spent>5:
                     logging.info(f"[minute] tasks took {spent:.2f}s")
@@ -736,7 +780,7 @@ def main():
                     if CB[s].blocked(): continue
                     bid, ask = broker.best_bid_ask(s)
                     # manage pending buy and trailing/ptp/ts
-                    strats[s].manage_intrabar(bid, ask)
+                    strats[s].manage_intrabar(bid, ask, CB[s])
                     CB[s].ok()
                 except Exception as e:
                     CB[s].fail("fast")
