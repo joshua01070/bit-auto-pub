@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_coin_auto_trade_live_final_v3_armed.py  (final with safety + backfill fixes + prewarm)
+multi_coin_auto_trade_live_final_v3_armed.py  (final: robust backfill + prewarm + safety/visibility)
 
 LIVE trading bot for "MTF Gating + 1m Armed Entry".
 - Backfilling 1m feed cache with multi-page pagination (<=200/req), robust gap/length diagnostics.
@@ -21,12 +21,11 @@ Backtest parity targets (align with backtest_breakout_partial_final_armed.py):
 - Optional execution at next 1m open on trigger (ARMED_EXEC=next_open).
 - Rounding via price_unit/round_price throughout.
 
-Patched changes:
-- Visibility: readiness diag에 short_armed1m(...) 포함, LOG_TRAIL=1 시 stop 인상/BE 로그 강화.
-- Safety A: fast loop에서 ARMED 윈도우 시간 만료 즉시 닫기.
-- Safety B: 호가 조회 실패 시 부분청산 스킵, 마지막 전량청산만 진행.
-- Backfill Fix: pagination 시 `to = (oldest - 1s)` 커서로 과거 페이지 강제 전진.
-- Prewarm: 부팅 시 필요 길이까지 즉시 백필(ENV: LIVE_PREWARM=1 기본 on).
+Patched changes (summary):
+- Backfill Fix: pagination cursor uses the fetched block's earliest time - 1s, with defensive jumps if overlap.
+- Prewarm: boot-time fetch to required length (LIVE_PREWARM=1 default).
+- Visibility: readiness diag includes short_armed1m(...); LOG_TRAIL=1 prints stop/BE bumps.
+- Safety: fast-loop ARMED expiry; partial-sell minKRW guard; buy serialization via mutex.
 """
 
 import os, time, json, math, logging, traceback, uuid, threading
@@ -307,7 +306,7 @@ class Feed:
     def _pull(self, to_ts: Optional[pd.Timestamp] = None, count: int = FETCH_PAGE) -> pd.DataFrame:
         kw = {"interval": "minute1", "count": min(int(count), 200)}
         if to_ts is not None:
-            # ensure KST naive for pyupbit
+            # KST naive for pyupbit; convert if tz-aware
             if getattr(to_ts, "tzinfo", None) is not None:
                 to_ts = to_ts.tz_convert("Asia/Seoul").tz_localize(None)
             kw["to"] = to_ts.strftime("%Y-%m-%d %H:%M:%S")
@@ -330,31 +329,69 @@ class Feed:
             self._cache = self._cache.iloc[-MAX_CACHE_MIN:]
 
     def _backfill_until(self, min_len: int, limit: int = BACKFILL_LIMIT):
-        # Cursor-based pagination: to = (oldest - 1s)
+        # Cursor-based pagination with robust fallback and real past advancement
         if self._cache is None or self._cache.empty:
-            return
+            self._sync_latest()
+            if self._cache is None or self._cache.empty:
+                return
+
         tries = 0
-        cursor = self._cache.index[0] - pd.Timedelta(seconds=1)
         prev_len = len(self._cache)
+        prev_oldest = self._cache.index[0]
+        cursor = prev_oldest - pd.Timedelta(seconds=1)  # start just before current oldest
 
         while len(self._cache) < min_len and tries < limit:
             older = self._pull(cursor)
             got = 0 if (older is None or older.empty) else len(older)
-            logging.info(f"[{self.ticker}] [backfill] try={tries+1}/{limit} to={cursor} got={got}")
+
+            # progress log
+            try:
+                now_oldest = self._cache.index[0]
+                now_latest = self._cache.index[-1]
+                logging.info(
+                    f"[{self.ticker}] [backfill] try={tries+1}/{limit} to={cursor} got={got} "
+                    f"| cache_len={len(self._cache)} oldest={now_oldest} latest={now_latest}"
+                )
+            except Exception:
+                logging.info(f"[{self.ticker}] [backfill] try={tries+1}/{limit} to={cursor} got={got}")
 
             if older is None or older.empty:
-                break
+                # push cursor further back (defensive jump)
+                cursor = cursor - pd.Timedelta(minutes=FETCH_PAGE * 2)
+                tries += 1
+                time.sleep(0.15)
+                continue
 
+            older_earliest = older.index[0]
+            older_latest   = older.index[-1]
+
+            # if the fetched block doesn't extend past prev_oldest, force jump and retry
+            if older_earliest >= prev_oldest and older_latest >= prev_oldest:
+                cursor = cursor - pd.Timedelta(minutes=FETCH_PAGE * 2)
+                tries += 1
+                time.sleep(0.15)
+                continue
+
+            # merge + dedup
             self._cache = pd.concat([older, self._cache]).sort_index()
             self._cache = self._cache[~self._cache.index.duplicated(keep="last")]
 
-            cursor = self._cache.index[0] - pd.Timedelta(seconds=1)
+            new_len = len(self._cache)
+            if new_len == prev_len:
+                # no growth -> additional jump
+                cursor = cursor - pd.Timedelta(minutes=FETCH_PAGE * 2)
+            else:
+                # next cursor from the fetched block's earliest - 1s (ensures continuous past advancement)
+                cursor = older_earliest - pd.Timedelta(seconds=1)
+                prev_len = new_len
+                prev_oldest = self._cache.index[0]
+
+            if new_len > MAX_CACHE_MIN:
+                self._cache = self._cache.iloc[-MAX_CACHE_MIN:]
+                prev_len = len(self._cache)
+                prev_oldest = self._cache.index[0]
+
             tries += 1
-
-            if len(self._cache) == prev_len:
-                cursor = cursor - pd.Timedelta(minutes=200)  # defensive jump
-            prev_len = len(self._cache)
-
             time.sleep(0.15)
 
     def fetch_1m_needed(self, need_minutes: int) -> pd.DataFrame:
@@ -545,7 +582,7 @@ class SymbolStrategy:
                     logging.info(f"[{self.symbol}] [SELL-skip] partial notional<{self.p.get('min_krw_order')} ({bid*qty:.1f})")
                     return
             except Exception as e:
-                # Safety B: only allow last-all when bid lookup fails
+                # Only allow last-all when bid lookup fails
                 if not is_last:
                     logging.warning(f"[{self.symbol}] [SELL-skip] no bid for partial; {e}")
                     return
@@ -669,7 +706,7 @@ class SymbolStrategy:
 
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
-        # Safety A: time-based ARMED expiry even if minute_task skipped
+        # fast-loop ARMED expiry (in case minute task missed)
         if self.state.is_armed and time.time() >= (self.state.armed_until or 0.0):
             self.state.is_armed = False
             self._save_state()
