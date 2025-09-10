@@ -52,16 +52,16 @@ DEFAULTS: Dict[str, Any] = dict(
 SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
     "KRW-BTC": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 60, "don_n": 64,
                 "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
+                "ptp_levels": "0.035:0.7", "tp_rate": 0.055, "fast_seq": "HL",
                 "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-ETH": {"tf_base": 5, "use_ma": 1, "ma_s": 10, "ma_l": 60, "don_n": 48,
                 "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "", "tp_rate": 0.035, "fast_seq": "HL",
+                "ptp_levels": "0.03:0.7", "tp_rate": 0.055, "fast_seq": "HL",
                 "armed_enable": 0, "entry_tick_buffer": 1},
     "KRW-SOL": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 45, "don_n": 96,
-                "buy_pct": 0.25, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "", "tp_rate": 0.03,  "fast_seq": "HL",
-                "armed_enable": 1, "armed_micro_trigger": "REBREAK",
+                "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
+                "ptp_levels": "0.02:0.3", "tp_rate": 0.06,  "fast_seq": "HL",
+                "armed_enable": 1, "armed_micro_trigger": "MA",
                 "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
 }
 
@@ -1149,3 +1149,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
