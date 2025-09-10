@@ -1,4 +1,3 @@
-
 import os, time, json, math, logging, traceback, uuid, threading
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict, Any
@@ -436,6 +435,9 @@ class SymbolStrategy:
         self.last_tf_idx: Optional[pd.Timestamp] = None
         self._lock = threading.RLock()
         self._ptp_deferred_ts: Dict[float, float] = {}  # level -> last log ts
+        # --- [PATCH#1] intrabar high tracking (bid-only), 1-min epoch reset ---
+        self._intrabar_high = 0.0
+        self._intrabar_epoch_min = -1
 
     # ---------- state helpers ----------
     def _load_state(self) -> PositionState:
@@ -672,7 +674,7 @@ class SymbolStrategy:
         up_buf = upper + price_unit(upper)*int(self.p.get("entry_tick_buffer",2))
         break_pass = prev_close > up_buf
 
-        # [gate-check] 상세 로그: 어떤 조건이 통과/미통과였는지 수치와 함께 출력
+        # [gate-check] 상세 로그
         if LOG_DATA_DIAG:
             try:
                 msg = (f"[{self.symbol}] [gate-check] "
@@ -794,6 +796,15 @@ class SymbolStrategy:
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
         now = time.time()
+        # --- [PATCH#1] intrabar high (bid-only) with 1-min reset ---
+        cur_min = int(now // 60)
+        if cur_min != self._intrabar_epoch_min:
+            self._intrabar_epoch_min = cur_min
+            self._intrabar_high = bid
+        else:
+            if bid > self._intrabar_high:
+                self._intrabar_high = bid
+
         # fast-loop ARMED expiry
         with self._lock:
             if self.state.is_armed and now >= (self.state.armed_until or 0.0):
@@ -847,9 +858,10 @@ class SymbolStrategy:
         if not has_pos:
             return
 
-        # trailing stop (uses current price)
-        trail=self._trail_step(); high_now=max(bid,ask)
-        self._raise_stop(round_price(high_now*(1.0-trail), "down"))
+        # --- [PATCH#1] trailing stop uses bid-only intrabar high ---
+        trail = self._trail_step()
+        high_now = self._intrabar_high
+        self._raise_stop(round_price(high_now*(1.0 - trail), "down"))
 
         # PTP + BE bump (with deferred throttle on notional<minKRW)
         if self.ptp_levels:
@@ -886,7 +898,10 @@ class SymbolStrategy:
                         with self._lock:
                             (self.state.ptp_hits or []).append(lv)
                             if int(self.p.get("ptp_be",0))==1:
-                                be=avg_px*(1.0+float(self.p["fee"])+float(self.p["eps_exec"]))
+                                # --- [PATCH#2] BE exact with both-side fee + execution epsilon ---
+                                fee = float(self.p["fee"])
+                                eps = float(self.p["eps_exec"])
+                                be  = avg_px * ((1.0 + fee) / (1.0 - fee)) * (1.0 + eps)
                                 self._raise_stop(round_price(be, "up"))
                                 self.state.tp1_done=True
                                 self._save_state()
