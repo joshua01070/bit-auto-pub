@@ -434,10 +434,17 @@ class SymbolStrategy:
         self.ptp_levels = parse_ptp_levels(self.p.get("ptp_levels", ""))
         self.last_tf_idx: Optional[pd.Timestamp] = None
         self._lock = threading.RLock()
-        self._ptp_deferred_ts: Dict[float, float] = {}  # level -> last log ts
-        # --- [PATCH#1] intrabar high tracking (bid-only), 1-min epoch reset ---
+        # (PATCH) use str keys for throttling/inflight to avoid float equality pitfalls
+        self._ptp_deferred_ts: Dict[str, float] = {}  # level_key -> last log ts
+        self._ptp_inflight = set()                    # {level_key}
+        # --- intrabar high tracking (bid-only), 1-min epoch reset ---
         self._intrabar_high = 0.0
         self._intrabar_epoch_min = -1
+
+    # helper: stable key for levels
+    @staticmethod
+    def _lv_key(lv: float) -> str:
+        return f"{lv:.6f}"
 
     # ---------- state helpers ----------
     def _load_state(self) -> PositionState:
@@ -796,7 +803,7 @@ class SymbolStrategy:
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
         now = time.time()
-        # --- [PATCH#1] intrabar high (bid-only) with 1-min reset ---
+        # intrabar high (bid-only) with 1-min reset
         cur_min = int(now // 60)
         if cur_min != self._intrabar_epoch_min:
             self._intrabar_epoch_min = cur_min
@@ -858,7 +865,7 @@ class SymbolStrategy:
         if not has_pos:
             return
 
-        # --- [PATCH#1] trailing stop uses bid-only intrabar high ---
+        # trailing stop (bid-only intrabar high)
         trail = self._trail_step()
         high_now = self._intrabar_high
         self._raise_stop(round_price(high_now*(1.0 - trail), "down"))
@@ -866,12 +873,15 @@ class SymbolStrategy:
         # PTP + BE bump (with deferred throttle on notional<minKRW)
         if self.ptp_levels:
             for (lv, fr) in self.ptp_levels:
+                level_key = self._lv_key(lv)
                 with self._lock:
-                    already = (lv in (self.state.ptp_hits or []))
-                    qty_now = self.state.qty
+                    already  = (lv in (self.state.ptp_hits or []))
+                    inflight = (level_key in self._ptp_inflight)  # same level already in flight?
+                    qty_now  = self.state.qty
                     init_qty = self.state.init_qty
-                    avg_px = self.state.avg
-                if already or qty_now<=0:
+                    avg_px   = self.state.avg
+                # already filled, same-level inflight, or no qty
+                if already or inflight or qty_now<=0:
                     continue
                 tgt=round_price(avg_px*(1.0+lv), "down")
                 if high_now>=tgt:
@@ -884,28 +894,34 @@ class SymbolStrategy:
                     if not is_last:
                         try:
                             if bid * sell_qty < float(self.p.get("min_krw_order", 6000.0)):
-                                last_log = self._ptp_deferred_ts.get(lv, 0.0)
+                                last_log = self._ptp_deferred_ts.get(level_key, 0.0)
                                 if (time.time() - last_log) >= PTP_DEFER_THROTTLE_SEC:
                                     logging.info(f"[{self.symbol}] [PTP-defer] lv={lv:.3f} qty={sell_qty:.8f} notional<{self.p.get('min_krw_order')}")
-                                    self._ptp_deferred_ts[lv] = time.time()
+                                    self._ptp_deferred_ts[level_key] = time.time()
                                 continue
                         except Exception as e:
                             # if bid check fails, fall back to _sell's own check
                             pass
 
-                    filled = self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
-                    if filled > 0.0:
+                    # Inflight guard set once we've passed checks
+                    with self._lock:
+                        self._ptp_inflight.add(level_key)
+                    try:
+                        filled = self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
+                        if filled > 0.0:
+                            with self._lock:
+                                (self.state.ptp_hits or []).append(lv)
+                                if int(self.p.get("ptp_be",0))==1:
+                                    fee = float(self.p["fee"])
+                                    eps = float(self.p["eps_exec"])
+                                    be  = avg_px * ((1.0 + fee) / (1.0 - fee)) * (1.0 + eps)
+                                    self._raise_stop(round_price(be, "up"))
+                                    self.state.tp1_done=True
+                                    self._save_state()
+                                    logging.info(f"[{self.symbol}] [BE] stop→{round_price(be,'up'):.0f}")
+                    finally:
                         with self._lock:
-                            (self.state.ptp_hits or []).append(lv)
-                            if int(self.p.get("ptp_be",0))==1:
-                                # --- [PATCH#2] BE exact with both-side fee + execution epsilon ---
-                                fee = float(self.p["fee"])
-                                eps = float(self.p["eps_exec"])
-                                be  = avg_px * ((1.0 + fee) / (1.0 - fee)) * (1.0 + eps)
-                                self._raise_stop(round_price(be, "up"))
-                                self.state.tp1_done=True
-                                self._save_state()
-                                logging.info(f"[{self.symbol}] [BE] stop→{round_price(be,'up'):.0f}")
+                            self._ptp_inflight.discard(level_key)
 
         # TP
         tp=float(self.p.get("tp_rate",0.0))
@@ -1149,4 +1165,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
