@@ -50,20 +50,29 @@ DEFAULTS: Dict[str, Any] = dict(
 )
 
 SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
-    "KRW-BTC": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 60, "don_n": 64,
-                "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "0.035:0.7", "tp_rate": 0.055, "fast_seq": "HL",
-                "armed_enable": 0, "entry_tick_buffer": 1},
-    "KRW-ETH": {"tf_base": 5, "use_ma": 1, "ma_s": 10, "ma_l": 60, "don_n": 48,
-                "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "0.03:0.7", "tp_rate": 0.055, "fast_seq": "HL",
-                "armed_enable": 0, "entry_tick_buffer": 1},
-    "KRW-SOL": {"tf_base": 5, "use_ma": 1, "ma_s": 8,  "ma_l": 45, "don_n": 96,
-                "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
-                "ptp_levels": "0.02:0.3", "tp_rate": 0.06,  "fast_seq": "HL",
-                "armed_enable": 1, "armed_micro_trigger": "MA",
-                "armed_inval_pct": 0.003, "entry_tick_buffer": 1},
+    "KRW-BTC": {
+        "tf_base": 5, "use_ma": 1, "ma_s": 8, "ma_l": 60, "don_n": 64,
+        "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
+        "ptp_levels": "0.035:0.7", "tp_rate": 0.055, "fast_seq": "HL",
+        "armed_enable": 0, "entry_tick_buffer": 1
+    },
+    "KRW-ETH": {
+        "tf_base": 5, "use_ma": 1, "ma_s": 10, "ma_l": 60, "don_n": 48,
+        "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
+        "ptp_levels": "0.03:0.7", "tp_rate": 0.055, "fast_seq": "HL",
+        "armed_enable": 0, "entry_tick_buffer": 1
+    },
+    "KRW-SOL": {
+        "tf_base": 5, "use_ma": 1, "ma_s": 8, "ma_l": 45, "don_n": 96,
+        "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
+        "ptp_levels": "0.03:0.3", "tp_rate": 0.045, "fast_seq": "HL",
+        "armed_enable": 1, "armed_micro_trigger": "MA",
+        "armed_ma_s_1m": 5, "armed_ma_l_1m": 30,
+        "armed_inval_pct": 0.003, "armed_reds": 3, "armed_window_min": 5,
+        "entry_tick_buffer": 1
+    },
 }
+
 
 POLL_SEC = 1.0
 STATE_DIR = "state_live_v3"
@@ -80,13 +89,13 @@ NEED_BUF_TF    = int(os.getenv("LIVE_NEED_BUF_TF", "80"))
 NEED_BUF_1M    = int(os.getenv("LIVE_NEED_BUF_1M", "60"))
 FETCH_PAGE     = int(os.getenv("LIVE_FETCH_COUNT", "200"))  # <=200 per pyupbit limit
 MAX_CACHE_MIN  = int(os.getenv("LIVE_MAX_CACHE_MIN", "5000"))
-ARMED_EXEC     = os.getenv("ARMED_EXEC", "next_open").lower()  # "next_open" | "immediate"
+ARMED_EXEC     = os.getenv("ARMED_EXEC", "immediate").lower()  # "next_open" | "immediate"
 PREWARM_AT_BOOT = int(os.getenv("LIVE_PREWARM", "1"))  # 부팅 시 필요 길이까지 즉시 백필
 PTP_DEFER_THROTTLE_SEC = int(os.getenv("PTP_DEFER_THROTTLE_SEC", "60"))
 
 # minute task pool
-FETCH_WORKERS    = min(3, len(TICKERS))     # conservative
-PER_TASK_TIMEOUT = 6.0                      # per-symbol minute task timeout
+FETCH_WORKERS    = min(len(TICKERS), 8)     # 티커 수만큼 병렬, 상한 8
+PER_TASK_TIMEOUT = 8.0                      # per-symbol minute task timeout
 
 # === BUY serialization across symbols (avoid KRW oversubscribe)
 BUY_LOCK = threading.Lock()
@@ -349,10 +358,8 @@ class Feed:
 
             new_len = len(self._cache)
             if new_len == prev_len:
-                # no growth -> additional jump
                 cursor = cursor - pd.Timedelta(minutes=FETCH_PAGE * 2)
             else:
-                # next cursor from the fetched block's earliest - 1s (ensures continuous past advancement)
                 cursor = older_earliest - pd.Timedelta(seconds=1)
                 prev_len = new_len
                 prev_oldest = self._cache.index[0]
@@ -437,14 +444,30 @@ class SymbolStrategy:
         # (PATCH) use str keys for throttling/inflight to avoid float equality pitfalls
         self._ptp_deferred_ts: Dict[str, float] = {}  # level_key -> last log ts
         self._ptp_inflight = set()                    # {level_key}
+        # (PATCH-PTP) runtime cache of completed levels (string keys) + tolerant check
+        self._ptp_done_keys = set()                   # {"0.035000"}
         # --- intrabar high tracking (bid-only), 1-min epoch reset ---
         self._intrabar_high = 0.0
         self._intrabar_epoch_min = -1
+        # seed runtime cache from persisted state
+        for _lv in (self.state.ptp_hits or []):
+            try:
+                self._ptp_done_keys.add(self._lv_key(float(_lv)))
+            except Exception:
+                pass
 
     # helper: stable key for levels
     @staticmethod
     def _lv_key(lv: float) -> str:
         return f"{lv:.6f}"
+
+    # tolerant "already hit" detector (handles float json roundtrip)
+    def _ptp_already(self, lv: float) -> bool:
+        key = self._lv_key(lv)
+        if key in self._ptp_done_keys:
+            return True
+        hits = self.state.ptp_hits or []
+        return any(abs(float(x) - float(lv)) <= 1e-9 for x in hits)
 
     # ---------- state helpers ----------
     def _load_state(self) -> PositionState:
@@ -472,6 +495,10 @@ class SymbolStrategy:
             st.is_armed=False; st.armed_until=0.0; st.armed_anchor_price=0.0
             st.red_run_1m=0; st.armed_open_ts=0.0
             st.pending_buy_ts=0.0; st.pending_buy_uuid=""; st.buy_guard_until=0.0
+            # (PATCH-PTP) clear runtime caches as this is a new flat state
+            self._ptp_done_keys.clear()
+            self._ptp_inflight.clear()
+            self._ptp_deferred_ts.clear()
             self._save_state()
 
     def _trail_step(self) -> float:
@@ -558,6 +585,7 @@ class SymbolStrategy:
                         self.state.init_qty=exch_qty; self.state.ptp_hits=[]; self.state.tp1_done=False
                         self.state.is_armed=False; self.state.pending_buy_ts=0.0
                         self.state.pending_buy_uuid=""; self.state.buy_guard_until=0.0
+                        self._ptp_done_keys.clear()  # 새 포지션 동기화 시 캐시 초기화
                         self._raise_stop(round_price(exch_avg*(1.0-self._trail_step()), "down"))
                         self._save_state()
                         logging.info(f"[{self.symbol}] [SYNC-before-buy] pos exists on exchange qty={exch_qty:.8f}@{exch_avg:.0f}")
@@ -597,6 +625,7 @@ class SymbolStrategy:
                 self.state.ts_anchor=avg
                 self.state.pending_buy_ts=0.0
                 self.state.pending_buy_uuid=""; self.state.buy_guard_until=0.0
+                self._ptp_done_keys.clear()  # 새 포지션 시작: 레벨 캐시 초기화
                 self._raise_stop(round_price(avg*(1.0-self._trail_step()), "down"))
                 self.state.is_armed=False; self._save_state()
             cb.ok()
@@ -747,58 +776,79 @@ class SymbolStrategy:
             if not self.state.is_armed:
                 return
             now_t = time.time()
-            if now_t >= self.state.armed_until:
+            armed_until = self.state.armed_until or 0.0
+            opened_ts = self.state.armed_open_ts or 0.0
+            if now_t >= armed_until:
                 self.state.is_armed=False; self._save_state()
                 logging.info(f"[{self.symbol}] [DISARMED] window expired")
                 log_event("armed_close", symbol=self.symbol, reason="window_expired")
                 return
 
         need_len = max(int(self.p["armed_ma_l_1m"])+1, int(self.p["armed_rebreak_lookback"])+3)
-        if df1m is None or len(df1m) < (need_len+1): return
+        if df1m is None or len(df1m) < (need_len+1): 
+            return
+
+        # 마지막으로 닫힌 1분봉 마감시각
         last_closed_ts = df1m.index[-1].to_pydatetime().timestamp()
-        with self._lock:
-            opened_ts = self.state.armed_open_ts or 0.0
-        if last_closed_ts <= opened_ts: return
+        preopen_epoch = (last_closed_ts <= opened_ts + 1e-9)
 
+        # 최근 두 개 1분봉
         prev1m, cur1m = df1m.iloc[-2], df1m.iloc[-1]
-        with self._lock:
-            self.state.red_run_1m = self.state.red_run_1m + 1 if cur1m["close"]<prev1m["close"] else 0
-            if int(self.p.get("armed_reds",3))>0 and self.state.red_run_1m>=int(self.p["armed_reds"]):
-                self.state.is_armed=False; self._save_state()
-                logging.info(f"[{self.symbol}] [DISARMED] reds={self.p['armed_reds']}")
-                log_event("armed_close", symbol=self.symbol, reason="reds")
-                return
 
-            # invalidate if 1m low pierces anchor*(1-inval)
-            if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):
-                self.state.is_armed=False; self._save_state()
-                logging.info(f"[{self.symbol}] [DISARMED] low<=anchor")
-                log_event("armed_close", symbol=self.symbol, reason="anchor_break")
-                return
+        # --- (pre-open이 아닐 때만) 디스암 조건 평가 ---
+        if not preopen_epoch:
+            with self._lock:
+                self.state.red_run_1m = self.state.red_run_1m + 1 if cur1m["close"]<prev1m["close"] else 0
+                if int(self.p.get("armed_reds",3))>0 and self.state.red_run_1m>=int(self.p["armed_reds"]):
+                    self.state.is_armed=False; self._save_state()
+                    logging.info(f"[{self.symbol}] [DISARMED] reds={self.p['armed_reds']}")
+                    log_event("armed_close", symbol=self.symbol, reason="reds")
+                    return
+                # invalidate if 1m low pierces anchor*(1-inval)
+                if float(cur1m["low"]) <= float(self.state.armed_anchor_price)*(1.0-float(self.p["armed_inval_pct"])):
+                    self.state.is_armed=False; self._save_state()
+                    logging.info(f"[{self.symbol}] [DISARMED] low<=anchor")
+                    log_event("armed_close", symbol=self.symbol, reason="anchor_break")
+                    return
+        # pre-open 구간에서는 예약 판단을 우선하고 디스암은 보류
 
+        # --- 트리거 판정 (MA / REBREAK) ---
         trig=str(self.p.get("armed_micro_trigger","MA")).upper(); trigger_ok=False
         if trig=="MA":
             s1=sma(df1m["close"],int(self.p["armed_ma_s_1m"])); l1=sma(df1m["close"],int(self.p["armed_ma_l_1m"]))
             if s1 is not None and l1 is not None and len(s1)>=2 and len(l1)>=2:
-                if s1.iloc[-2] <= l1.iloc[-2] and s1.iloc[-1] > l1.iloc[-1]: trigger_ok=True
+                # 직전→현재 1분 사이 크로스
+                if s1.iloc[-2] <= l1.iloc[-2] and s1.iloc[-1] > l1.iloc[-1]:
+                    trigger_ok=True
         elif trig=="REBREAK":
-            k=int(self.p["armed_rebreak_lookback"]); recent_high=float(df1m["high"].iloc[-k-1:-1].max())
-            if float(cur1m["close"])>recent_high: trigger_ok=True
+            k=int(self.p["armed_rebreak_lookback"])
+            recent_high=float(df1m["high"].iloc[-k-1:-1].max())
+            if float(cur1m["close"])>recent_high:
+                trigger_ok=True
 
+        # --- 실행(예약/즉시) ---
         with self._lock:
             can_buy = trigger_ok and (not cb.blocked()) and (not self.state.has_pos)
+
         if can_buy:
             if ARMED_EXEC == "next_open":
+                # pre-open이면 윈도우 오픈 직후 첫 1분 오픈가, 아니면 현재 시각 기준 다음 1분 오픈가
+                base_ts = opened_ts if preopen_epoch else time.time()
+                pending_ts = math.floor(base_ts/60)*60 + 60
+                # 혹시 지났다면 현재 기준으로 보정
+                if pending_ts <= time.time():
+                    pending_ts = math.floor(time.time()/60)*60 + 60
                 with self._lock:
-                    self.state.pending_buy_ts = math.floor(time.time()/60)*60 + 60
+                    self.state.pending_buy_ts = pending_ts
                     self._save_state()
-                logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY_PENDING(NEXT_OPEN)")
+                logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY_PENDING(NEXT_OPEN){' (pre-open)' if preopen_epoch else ''}")
                 log_event("armed_trigger", symbol=self.symbol, trigger=trig, exec="next_open",
-                          pending_ts=self.state.pending_buy_ts)
+                          pending_ts=pending_ts, preopen=int(preopen_epoch))
             else:
-                logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY_NOW")
-                log_event("armed_trigger", symbol=self.symbol, trigger=trig, exec="immediate")
-                self._enter_position(cb,f"ARMED-{trig}")
+                reason = f"ARMED-{trig}-PREOPEN" if preopen_epoch else f"ARMED-{trig}"
+                logging.info(f"[{self.symbol}] [TRIGGER-{trig}] confirmed → BUY_NOW{' (pre-open)' if preopen_epoch else ''}")
+                log_event("armed_trigger", symbol=self.symbol, trigger=trig, exec="immediate", preopen=int(preopen_epoch))
+                self._enter_position(cb, reason)
 
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
@@ -842,6 +892,7 @@ class SymbolStrategy:
                         self.state.pending_buy_ts = 0.0
                         self.state.is_armed=False
                         self.state.pending_buy_uuid=""; self.state.buy_guard_until=0.0
+                        self._ptp_done_keys.clear()
                         self._raise_stop(round_price(exch_avg*(1.0-self._trail_step()), "down"))
                         self._save_state()
                         pass_to_buy = False
@@ -875,8 +926,8 @@ class SymbolStrategy:
             for (lv, fr) in self.ptp_levels:
                 level_key = self._lv_key(lv)
                 with self._lock:
-                    already  = (lv in (self.state.ptp_hits or []))
-                    inflight = (level_key in self._ptp_inflight)  # same level already in flight?
+                    already  = self._ptp_already(lv)          # (PATCH) tolerant check + runtime cache
+                    inflight = (level_key in self._ptp_inflight)
                     qty_now  = self.state.qty
                     init_qty = self.state.init_qty
                     avg_px   = self.state.avg
@@ -899,7 +950,7 @@ class SymbolStrategy:
                                     logging.info(f"[{self.symbol}] [PTP-defer] lv={lv:.3f} qty={sell_qty:.8f} notional<{self.p.get('min_krw_order')}")
                                     self._ptp_deferred_ts[level_key] = time.time()
                                 continue
-                        except Exception as e:
+                        except Exception:
                             # if bid check fails, fall back to _sell's own check
                             pass
 
@@ -910,15 +961,20 @@ class SymbolStrategy:
                         filled = self._sell(sell_qty, f"PTP({lv:.3f},{fr:.2f})")
                         if filled > 0.0:
                             with self._lock:
-                                (self.state.ptp_hits or []).append(lv)
+                                # (PATCH) 기록은 허용오차 비교 후 한 번만
+                                if self.state.ptp_hits is None:
+                                    self.state.ptp_hits = []
+                                if not any(abs(float(x) - float(lv)) <= 1e-9 for x in (self.state.ptp_hits or [])):
+                                    self.state.ptp_hits.append(lv)
+                                self._ptp_done_keys.add(level_key)
                                 if int(self.p.get("ptp_be",0))==1:
                                     fee = float(self.p["fee"])
                                     eps = float(self.p["eps_exec"])
                                     be  = avg_px * ((1.0 + fee) / (1.0 - fee)) * (1.0 + eps)
                                     self._raise_stop(round_price(be, "up"))
                                     self.state.tp1_done=True
-                                    self._save_state()
-                                    logging.info(f"[{self.symbol}] [BE] stop→{round_price(be,'up'):.0f}")
+                                self._save_state()
+                                logging.info(f"[{self.symbol}] [BE] stop→{round_price(be,'up'):.0f}" if int(self.p.get("ptp_be",0))==1 else f"[{self.symbol}] [PTP] hit lv={lv:.3f}")
                     finally:
                         with self._lock:
                             self._ptp_inflight.discard(level_key)
@@ -952,6 +1008,7 @@ def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBrok
                     stg.state.init_qty=qty; stg.state.ptp_hits=[]; stg.state.tp1_done=False
                     stg.state.is_armed=False; stg.state.pending_buy_ts=0.0
                     stg.state.pending_buy_uuid=""; stg.state.buy_guard_until=0.0
+                    stg._ptp_done_keys.clear()
                     stg._raise_stop(round_price(avg*(1.0-stg._trail_step()), "down"))
                     stg._save_state()
                 logging.info(f"[{sym}] [RECONCILE] qty={qty:.8f}, avg={avg:.0f}")
