@@ -33,10 +33,11 @@ def log_event(event: str, **data):
         logging.warning(f"[eventlog] write failed: {e}")
 
 # ========================= config =========================
+#하드코딩된 API 키 (여기에 직접 입력)
 ACCESS = ""
 SECRET = ""
 
-TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-SOL"]
+TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP"]
 STATE_SCHEMA_VER = 5  # (+pending_buy_uuid, +buy_guard_until)
 
 DEFAULTS: Dict[str, Any] = dict(
@@ -52,27 +53,34 @@ DEFAULTS: Dict[str, Any] = dict(
 SYMBOL_PARAMS_DEFAULT: Dict[str, Dict[str, Any]] = {
     "KRW-BTC": {
         "tf_base": 5, "use_ma": 1, "ma_s": 8, "ma_l": 60, "don_n": 64,
-        "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
+        "buy_pct": 0.40, "trail_before": 0.08, "trail_after": 0.08,
         "ptp_levels": "0.035:0.7", "tp_rate": 0.055, "fast_seq": "HL",
         "armed_enable": 0, "entry_tick_buffer": 1
     },
     "KRW-ETH": {
         "tf_base": 5, "use_ma": 1, "ma_s": 10, "ma_l": 60, "don_n": 48,
-        "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
+        "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
         "ptp_levels": "0.03:0.7", "tp_rate": 0.055, "fast_seq": "HL",
         "armed_enable": 0, "entry_tick_buffer": 1
     },
     "KRW-SOL": {
         "tf_base": 5, "use_ma": 1, "ma_s": 8, "ma_l": 45, "don_n": 96,
-        "buy_pct": 0.30, "trail_before": 0.08, "trail_after": 0.08,
+        "buy_pct": 0.35, "trail_before": 0.08, "trail_after": 0.08,
         "ptp_levels": "0.03:0.3", "tp_rate": 0.045, "fast_seq": "HL",
         "armed_enable": 1, "armed_micro_trigger": "MA",
         "armed_ma_s_1m": 5, "armed_ma_l_1m": 30,
         "armed_inval_pct": 0.003, "armed_reds": 3, "armed_window_min": 5,
         "entry_tick_buffer": 1
     },
+    "KRW-XRP": {
+        "tf_base": 5, "use_ma": 1, "ma_s": 10, "ma_l": 60, "don_n": 120,
+        "buy_pct": 0.30,
+        "trail_before": 0.04, "trail_after": 0.04,
+        "ptp_levels": "0.020:0.5",   # 1차 2%에서 50% 익절
+        "tp_rate": 0.06, "fast_seq": "HL",
+        "armed_enable": 0, "entry_tick_buffer": 1
+    },
 }
-
 
 POLL_SEC = 1.0
 STATE_DIR = "state_live_v3"
@@ -469,6 +477,15 @@ class SymbolStrategy:
         hits = self.state.ptp_hits or []
         return any(abs(float(x) - float(lv)) <= 1e-9 for x in hits)
 
+    # ---------- dust helper ----------
+    def _is_dust(self, qty: float, ref_px: float) -> bool:
+        """qty*ref_px가 최소주문금액*margin보다 작으면 더스트로 간주(주문 없이 로컬만 플랫)."""
+        if qty <= 0 or ref_px <= 0:
+            return False
+        min_krw = float(self.p.get("min_krw_order", 6000.0))
+        margin  = float(self.p.get("dust_margin", 0.98))
+        return (qty * ref_px) < (min_krw * margin)
+
     # ---------- state helpers ----------
     def _load_state(self) -> PositionState:
         try:
@@ -577,6 +594,14 @@ class SymbolStrategy:
 
             # pre-buy: reconcile & guard
             exch_qty, exch_avg = self._exchange_position_snapshot()
+            # (DUST) 거래소 잔고가 더스트면 0으로 간주하여 진입 방해 제거
+            try:
+                bid, _ = self.broker.best_bid_ask(self.symbol)
+                if self._is_dust(exch_qty, bid):
+                    exch_qty = 0.0
+            except Exception:
+                pass
+
             with self._lock:
                 if self.state.has_pos or exch_qty > 1e-12:
                     # sync if needed
@@ -721,7 +746,7 @@ class SymbolStrategy:
                        f"ma_pass={bool(ma_pass)}")
                 if int(self.p['use_ma'])==1 and ms is not None and ml is not None \
                    and not pd.isna(ms.iloc[-1]) and not pd.isna(ml.iloc[-1]):
-                    msg += f" (ms={float(ms.iloc[-1]):.2f} > ml={float(ml.iloc[-1]):.2f})"
+                    msg += f" (ms={float(ms.iloc[-1]) :.2f} > ml={float(ml.iloc[-1]) :.2f})"
                 logging.info(msg)
             except Exception:
                 logging.info(f"[{self.symbol}] [gate-check] break_pass={break_pass} ma_pass={ma_pass}")
@@ -853,6 +878,19 @@ class SymbolStrategy:
     # ----- intrabar manage (1s) -----
     def manage_intrabar(self, bid: float, ask: float, cb: CircuitBreaker):
         now = time.time()
+
+        # --- DUST: 포지션이 있고 평가금액이 더스트면 주문 없이 로컬만 플랫 처리 ---
+        with self._lock:
+            had_pos = self.state.has_pos
+            qty_now = self.state.qty
+        if had_pos and self._is_dust(qty_now, bid):
+            self.reset_state_inplace()
+            logging.info(f"[{self.symbol}] [DUST->FLAT] notional≈{bid*qty_now:.1f} KRW (qty={qty_now:.8f})")
+            log_event("dust_local_flat", symbol=self.symbol, qty=qty_now, bid=bid)
+            # 플랫이므로 이후 TS/PTP/TP 관리 스킵
+            # (armed/pending 등은 상태에 의해 영향 없음)
+            return
+
         # intrabar high (bid-only) with 1-min reset
         cur_min = int(now // 60)
         if cur_min != self._intrabar_epoch_min:
@@ -1002,6 +1040,15 @@ def reconcile_from_exchange(strats: Dict[str, SymbolStrategy], broker: UpbitBrok
         for sym, stg in strats.items():
             ccy=sym.split("-")[1]; b=by_ccy.get(ccy)
             qty=float((b or {}).get("balance") or 0.0); avg=float((b or {}).get("avg_buy_price") or 0.0)
+
+            # (DUST) 부팅 시 더스트면 flat 간주
+            try:
+                bid, _ = broker.best_bid_ask(sym)
+                if bid > 0 and stg._is_dust(qty, bid):
+                    qty = 0.0
+            except Exception:
+                pass
+
             if qty>1e-12:
                 with stg._lock:
                     stg.state.has_pos=True; stg.state.qty=qty; stg.state.avg=avg
@@ -1060,7 +1107,7 @@ def prewarm_at_boot(feeds: Dict[str, 'Feed'], strats: Dict[str, 'SymbolStrategy'
 # ========================= main loop (tick scheduler) =========================
 def main():
     if not ACCESS or not SECRET:
-        raise SystemExit("ACCESS/SECRET required. Set env UPBIT_ACCESS/UPBIT_SECRET.")
+        raise SystemExit("ACCESS/SECRET required. Set ACCESS/SECRET variables in this script.")
     broker=UpbitBroker(ACCESS, SECRET)
     params_by_symbol=load_symbol_params()
     feeds={s: Feed(s) for s in TICKERS}
@@ -1174,7 +1221,7 @@ def main():
                 # ===== fast loop: every second manage intrabar =====
                 for s in TICKERS:
                     try:
-                        if CB[s].blocked(): continue
+                        # CB 차단 여부와 무관하게 포지션 관리(스탑/익절)는 항상 실행
                         bid, ask = broker.best_bid_ask(s)
                         strats[s].manage_intrabar(bid, ask, CB[s])
                         CB[s].ok()
